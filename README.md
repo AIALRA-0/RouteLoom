@@ -2,6 +2,11 @@
 <h1>RouteLoom</h1>
 <p>把个人 Codex 执行能力和受控 ChatGPT 网页会话接入一个可审计、可恢复的私有调用入口</p>
 <p><code>0.1.0 预发布</code> · <code>Apache-2.0</code> · <code>公开源码</code> · <code>私有部署</code></p>
+<p>
+  <a href="https://gitlab.aialra.online/aialra/routeloom/-/pipelines"><img alt="GitLab CI" src="https://gitlab.aialra.online/aialra/routeloom/badges/main/pipeline.svg"></a>
+  <img alt="版本 0.1.0 预发布" src="https://img.shields.io/badge/version-0.1.0--prerelease-555555">
+  <img alt="Apache 2.0 许可证" src="https://img.shields.io/badge/license-Apache--2.0-111111">
+</p>
 <p><a href="README.en.md">English</a> · <a href="docs/usage.md">使用指南</a> · <a href="docs/api-capabilities.md">接口能力</a> · <a href="docs/deployment.md">部署指南</a> · <a href="SECURITY.md">安全政策</a></p>
 </div>
 

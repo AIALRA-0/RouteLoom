@@ -313,6 +313,21 @@ function manualRecoveryState(error) {
   return null;
 }
 
+function reclaimableAuthenticatedPage(page, expectedDocumentToken = null) {
+  const diagnostics = page?.diagnostics;
+  const documentToken = diagnostics?.documentToken ?? null;
+  return Boolean(
+    page?.pageReady &&
+    page.authenticated &&
+    !page.failureCode &&
+    diagnostics?.freshConversation === true &&
+    documentToken &&
+    (!expectedDocumentToken || documentToken === expectedDocumentToken) &&
+    diagnostics.activeInvocation === false &&
+    diagnostics.visibleErrorCount === 0,
+  );
+}
+
 async function resetSlot(slot, expectedIntentId = null) {
   if (expectedIntentId && slot.intentId !== expectedIntentId) return null;
   if (slot.resetPromise) return slot.resetPromise;
@@ -451,37 +466,58 @@ async function probeSlot(slot, discoverModels) {
     // cooldown.  An apparently blank page is not sufficient evidence to clear
     // those conditions automatically.
     if (slot.state === "quarantined") return page;
-    const emptyHome =
-      page?.pageReady &&
-      page.authenticated &&
-      !page.failureCode &&
-      page.diagnostics?.freshConversation === true &&
-      Boolean(page.diagnostics.documentToken) &&
-      page.diagnostics.activeInvocation === false &&
-      page.diagnostics.visibleErrorCount === 0;
-    if (!emptyHome || activeJobs.size || slot.resetPromise) return page;
+    if (!reclaimableAuthenticatedPage(page) || activeJobs.size || slot.resetPromise) return page;
     // The administrator may have completed a login or verification challenge in
-    // this exact managed document.  It is already authenticated, empty and
-    // stable, so reclaim it in place.  Reloading here creates a startup race in
-    // which /api/auth/session can briefly look anonymous and sends the slot back
-    // to login_required even though the account is healthy.
-    await patchSlot(slot, {
-      state: "idle",
-      documentToken: page.diagnostics.documentToken ?? null,
-      submitted: false,
-      jobHash: null,
-      intentId: null,
-      leaseEpoch: null,
-      permitExpiresAt: null,
-      submitConsumed: false,
-      progressSequence: 0,
-      contentProgressSequence: 0,
-      progressPhase: null,
-      quarantinedUntil: null,
-      resetFailureCount: 0,
-      resetBackoffUntil: null,
-    });
-    return page;
+    // this exact managed document. Confirm that the same empty document remains
+    // stable before reclaiming it in place. Reloading here creates a startup race
+    // in which /api/auth/session can briefly look anonymous and sends the slot
+    // back to login_required even though the account is healthy.
+    const expectedDocumentToken = page.diagnostics.documentToken;
+    const reclaiming = (async () => {
+      let stablePage = page;
+      const stableSince = Date.now();
+      for (let read = 1; read < READY_STABLE_READS; read += 1) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, Math.ceil(READY_STABILITY_MS / (READY_STABLE_READS - 1))),
+        );
+        if (activeJobs.size || slot.state !== "login_required") return stablePage;
+        stablePage = await sendToTab(
+          slot.tabId,
+          { type: "aialra.probe", discoverModels: false, discoverQuota: false },
+          2,
+        ).catch(() => null);
+        if (!reclaimableAuthenticatedPage(stablePage, expectedDocumentToken)) return stablePage;
+      }
+      if (
+        Date.now() - stableSince < READY_STABILITY_MS ||
+        activeJobs.size ||
+        slot.state !== "login_required"
+      )
+        return stablePage;
+      await patchSlot(slot, {
+        state: "idle",
+        documentToken: expectedDocumentToken,
+        submitted: false,
+        jobHash: null,
+        intentId: null,
+        leaseEpoch: null,
+        permitExpiresAt: null,
+        submitConsumed: false,
+        progressSequence: 0,
+        contentProgressSequence: 0,
+        progressPhase: null,
+        quarantinedUntil: null,
+        resetFailureCount: 0,
+        resetBackoffUntil: null,
+      });
+      return stablePage;
+    })();
+    slot.resetPromise = reclaiming;
+    try {
+      return await reclaiming;
+    } finally {
+      if (slot.resetPromise === reclaiming) slot.resetPromise = null;
+    }
   }
   if (
     !discoverModels ||

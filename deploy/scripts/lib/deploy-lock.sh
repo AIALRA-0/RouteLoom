@@ -10,7 +10,10 @@ acquire_routeloom_deploy_lock() {
     return 1
   }
 
-  local lock_file="${ROUTELOOM_DEPLOY_LOCK_FILE:-/run/lock/routeloom-deploy.lock}"
+  # The lock path is an operational compatibility boundary. Older rollback
+  # releases use this same file, so the renamed release cannot build or switch
+  # concurrently with them.
+  local lock_file="${ROUTELOOM_DEPLOY_LOCK_FILE:-/run/lock/aialra-model-router-deploy.lock}"
   local owner_file="${lock_file}.owner"
   local lock_directory
   lock_directory="$(dirname "$lock_file")"
@@ -32,5 +35,5 @@ acquire_routeloom_deploy_lock() {
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$owner_file"
   umask "$previous_umask"
   export ROUTELOOM_DEPLOY_LOCK_HELD=true
-  trap 'rm -f -- "${ROUTELOOM_DEPLOY_LOCK_FILE:-/run/lock/routeloom-deploy.lock}.owner"' EXIT
+  trap 'rm -f -- "${ROUTELOOM_DEPLOY_LOCK_FILE:-/run/lock/aialra-model-router-deploy.lock}.owner"' EXIT
 }

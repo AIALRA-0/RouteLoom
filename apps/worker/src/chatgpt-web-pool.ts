@@ -156,7 +156,7 @@ function accountEligibleForLease(account: ChatGptWebAccount, nowMs: number): boo
 function bridgeRecoveredToIdle(health: Record<string, unknown>): boolean {
   const slots = healthSlots(health);
   const slotsAreIdle =
-    slots.length === 0 || slots.every((slot) => slot.state === "idle" && !slot.submitted);
+    slots.length > 0 && slots.every((slot) => slot.state === "idle" && !slot.submitted);
   return (
     Number(health.pending ?? 0) === 0 &&
     (health.activeJobId === null || health.activeJobId === undefined) &&
@@ -242,11 +242,10 @@ function accountPublicPatch(
   } else if (heartbeatStale || !extensionConnected || !pageReady || !sandboxVerified) {
     state = "stale";
   } else if (current.qualified || current.lastProbePassed === true) {
-    // A browser restart can briefly report an incomplete health snapshot. Keep
-    // the successful qualification fact and restore eligibility once the
-    // bridge is healthy again instead of requiring another real submission.
+    // Keep the historical qualification fact, but do not admit new work until
+    // the bridge proves that at least one slot is idle and owns no prior task.
     qualified = true;
-    state = "ready";
+    state = bridgeRecoveredToIdle(health) ? "ready" : "stale";
   } else state = "configured";
 
   if (rateLimited) {

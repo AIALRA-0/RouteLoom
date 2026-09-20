@@ -2,6 +2,11 @@
 <h1>RouteLoom</h1>
 <p>A private, auditable, and recoverable gateway for personal Codex execution and controlled ChatGPT web sessions</p>
 <p><code>0.1.0 prerelease</code> · <code>Apache-2.0</code> · <code>public source</code> · <code>private deployment</code></p>
+<p>
+  <a href="https://gitlab.aialra.online/aialra/routeloom/-/pipelines"><img alt="GitLab CI" src="https://gitlab.aialra.online/aialra/routeloom/badges/main/pipeline.svg"></a>
+  <img alt="Version 0.1.0 prerelease" src="https://img.shields.io/badge/version-0.1.0--prerelease-555555">
+  <img alt="Apache 2.0 license" src="https://img.shields.io/badge/license-Apache--2.0-111111">
+</p>
 <p><a href="README.md">中文</a> · <a href="docs/usage.md">Usage</a> · <a href="docs/api-capabilities.md">API capabilities</a> · <a href="docs/deployment.md">Deployment</a> · <a href="SECURITY.md">Security</a></p>
 </div>
 

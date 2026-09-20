@@ -35,7 +35,15 @@ function health(accountId: string): Record<string, unknown> {
     pageReady: true,
     authenticated: true,
     activeTabs: 0,
-    slots: [],
+    slots: [
+      {
+        slotId: randomUUID(),
+        state: "idle",
+        submitted: false,
+        quarantinedUntil: null,
+        updatedAt: new Date().toISOString(),
+      },
+    ],
     quarantinedTabs: 0,
     adapterVersion: "dom-bridge-v2",
     failureCode: null,
@@ -671,6 +679,39 @@ describe("ChatGptWebPoolProvider", () => {
     expect(await repository.findChatGptWebAccount("account-a")).toMatchObject({
       qualified: true,
       state: "ready",
+      lastProbePassed: true,
+    });
+  });
+
+  it("does not admit a qualified account while its browser slot is not idle", async () => {
+    const { repository, configs } = await readyRepository();
+    await repository.updateChatGptWebAccount("account-a", { lastProbePassed: true });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: URL | RequestInfo) => {
+        const accountId = String(input).includes("account-b") ? "account-b" : "account-a";
+        const snapshot = health(accountId);
+        if (accountId === "account-a") {
+          snapshot.slots = [
+            {
+              slotId: randomUUID(),
+              state: "login_required",
+              submitted: false,
+              quarantinedUntil: null,
+              updatedAt: new Date().toISOString(),
+            },
+          ];
+        }
+        return Response.json(snapshot);
+      }),
+    );
+    const pool = new ChatGptWebPoolProvider(repository, configs, "synthetic-token", true);
+
+    await pool.syncAccounts();
+
+    expect(await repository.findChatGptWebAccount("account-a")).toMatchObject({
+      qualified: true,
+      state: "stale",
       lastProbePassed: true,
     });
   });

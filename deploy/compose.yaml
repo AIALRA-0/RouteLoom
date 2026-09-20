@@ -1,4 +1,6 @@
-name: routeloom
+# Keep the existing Compose identity across the RouteLoom rename. Container,
+# network and volume ownership must not fork into a second production stack.
+name: aialra-model-router
 
 services:
   postgres:

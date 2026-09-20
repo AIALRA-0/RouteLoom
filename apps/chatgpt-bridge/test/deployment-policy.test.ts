@@ -9,7 +9,7 @@ describe("production release serialization and provenance", () => {
   it("uses one shared lock for build and runtime switch operations", () => {
     const lock = rootFile("deploy/scripts/lib/deploy-lock.sh");
     expect(lock).toContain("flock -n");
-    expect(lock).toContain("routeloom-deploy.lock");
+    expect(lock).toContain("aialra-model-router-deploy.lock");
     for (const script of [
       "deploy/scripts/install-compose-release.sh",
       "deploy/scripts/enable-chatgpt-web.sh",
@@ -33,5 +33,10 @@ describe("production release serialization and provenance", () => {
     expect(containerfile.match(/LABEL org\.opencontainers\.image\.revision=/g)).toHaveLength(6);
     expect(verifier).toContain("org.opencontainers.image.revision");
     expect(verifier).toContain("does not match ROUTELOOM_RELEASE_REVISION");
+  });
+
+  it("preserves the production Compose identity across the product rename", () => {
+    const compose = rootFile("deploy/compose.yaml");
+    expect(compose).toContain("name: aialra-model-router");
   });
 });

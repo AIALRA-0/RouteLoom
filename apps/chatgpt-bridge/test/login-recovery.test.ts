@@ -64,6 +64,8 @@ function recoveryHarness() {
     patchSlot,
     RESET_BACKOFF_INITIAL_MS: 30_000,
     RESET_BACKOFF_MAX_MS: 5 * 60_000,
+    READY_STABILITY_MS: 0,
+    READY_STABLE_READS: 2,
     poolMutation: Promise.resolve(),
     restoreSlots: async () => undefined,
     createSlot: async () => undefined,
@@ -128,6 +130,33 @@ describe("browser login recovery", () => {
       resetBackoffUntil: null,
     });
     expect(h.navigateToFreshChat).not.toHaveBeenCalled();
+  });
+
+  it("does not reclaim when the managed document changes during confirmation", async () => {
+    const h = recoveryHarness();
+    h.slot.state = "login_required";
+    h.sendToTab.mockResolvedValueOnce(readyPage).mockResolvedValueOnce({
+      ...readyPage,
+      diagnostics: { ...readyPage.diagnostics, documentToken: "different-document" },
+    });
+
+    await h.functions.probeSlot(h.slot, false);
+
+    expect(h.slot.state).toBe("login_required");
+    expect(h.patchSlot).not.toHaveBeenCalled();
+  });
+
+  it("shares one authenticated-page confirmation across concurrent probes", async () => {
+    const h = recoveryHarness();
+    h.slot.state = "login_required";
+    const [first, second] = await Promise.all([
+      h.functions.probeSlot(h.slot, false),
+      h.functions.probeSlot(h.slot, false),
+    ]);
+
+    expect(first).toEqual(readyPage);
+    expect(second).toEqual(readyPage);
+    expect(h.patchSlot).toHaveBeenCalledOnce();
   });
 
   it.each([
