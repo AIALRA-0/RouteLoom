@@ -26,6 +26,7 @@ const readyPage = {
     freshConversation: true,
     activeInvocation: false,
     visibleErrorCount: 0,
+    visibleErrorKinds: [],
   },
 };
 
@@ -161,7 +162,7 @@ describe("browser login recovery", () => {
 
   it.each([
     ["not a fresh conversation", { freshConversation: false }],
-    ["a visible page error", { visibleErrorCount: 1 }],
+    ["a visible page error", { visibleErrorCount: 1, visibleErrorKinds: ["generation_error"] }],
     ["a page-owned invocation", { activeInvocation: true }],
     ["a missing document identity", { documentToken: null }],
   ])("does not reclaim a login slot with %s", async (_name, diagnosticPatch) => {
@@ -176,6 +177,24 @@ describe("browser login recovery", () => {
 
     expect(h.slot.state).toBe("login_required");
     expect(h.patchSlot).not.toHaveBeenCalled();
+  });
+
+  it("allows a benign ARIA live-region notice after stable page confirmation", async () => {
+    const h = recoveryHarness();
+    h.slot.state = "login_required";
+    h.setPage({
+      ...readyPage,
+      diagnostics: {
+        ...readyPage.diagnostics,
+        visibleErrorCount: 1,
+        visibleErrorKinds: ["other"],
+      },
+    });
+
+    await h.functions.probeSlot(h.slot, false);
+
+    expect(h.slot.state).toBe("idle");
+    expect(h.patchSlot).toHaveBeenCalledOnce();
   });
 
   it("never clears quarantine from a blank page alone", async () => {

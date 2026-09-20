@@ -313,6 +313,11 @@ function manualRecoveryState(error) {
   return null;
 }
 
+function hasBlockingVisibleError(diagnostics) {
+  const kinds = diagnostics?.visibleErrorKinds ?? [];
+  return kinds.some((kind) => kind !== "other");
+}
+
 function reclaimableAuthenticatedPage(page, expectedDocumentToken = null) {
   const diagnostics = page?.diagnostics;
   const documentToken = diagnostics?.documentToken ?? null;
@@ -324,7 +329,7 @@ function reclaimableAuthenticatedPage(page, expectedDocumentToken = null) {
     documentToken &&
     (!expectedDocumentToken || documentToken === expectedDocumentToken) &&
     diagnostics.activeInvocation === false &&
-    diagnostics.visibleErrorCount === 0,
+    !hasBlockingVisibleError(diagnostics),
   );
 }
 
