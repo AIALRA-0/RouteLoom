@@ -1,0 +1,215 @@
+# 1 VPS 部署
+
+## 1.1 目标拓扑
+
+生产环境复用现有 Docker、Nginx、Authentik、Tailscale 和 Cloudflare DNS；项目只占用回环端口 `13210`（API）、`13211`（Web）、`13212`（Worker 指标）和 `13213`（PostgreSQL）；Runner 的 `13214` 只存在于内部容器网络
+
+Nginx 只绑定 Tailscale IPv4，不在公网网卡监听；根路径直接进入控制台登录，所有页面、API、OpenAPI 和健康接口先受 Tailnet 限制；浏览器再经过 Authentik，Agent 使用作用域 API 密钥
+
+## 1.2 安全发布顺序
+
+以下示例使用占位值；真实域名、服务器路径和凭据只在目标机的 root-only 环境中设置
+
+### 第一步：准备专用账户和目录
+
+```bash
+sudo bash deploy/scripts/prepare-vps.sh
+```
+
+该脚本不会清理 Docker，也不会修改其他项目的容器、网络、卷或 Nginx 站点
+
+### 第二步：生成生产密钥
+
+```bash
+sudo ROUTER_HOST=router.example.com bash deploy/scripts/prepare-production.sh
+```
+
+生成后的 `production.env` 默认包含 `JOB_SUBMISSION_ENABLED=false`；这意味着控制面可以上线，但在专用 Codex 登录和隔离探针完成前不会接收任务
+
+### 第三步：构建控制面
+
+```bash
+sudo RELEASE_DIR=/srv/example/routeloom/releases/<commit> \
+  PRODUCTION_ENV=/var/lib/routeloom/production.env \
+  bash deploy/scripts/install-compose-release.sh
+```
+
+脚本启动 PostgreSQL、API 和 Web，不启动 Worker；正式版本应优先使用 GHCR 返回的不可变镜像摘要，并先运行 `verify-production-images.sh`；VPS 源码构建只适合受控预发布
+
+发布目录必须使用完整的 40 位 Git 提交号命名。构建、切换版本、启停 Worker 和启停网页通道共用 `/run/lock/routeloom-deploy.lock`；已有操作持锁时，后来的操作会直接拒绝并显示持有者，不允许两个 Agent 同时构建或重建生产组件
+
+所有应用镜像都写入 `org.opencontainers.image.revision` 标签。部署后必须用 `ROUTELOOM_RELEASE_REVISION=<commit> deploy/scripts/verify-production-images.sh` 核对不可变镜像摘要和提交标签；不得把未提交文件复制进正在运行的容器，也不得让热补丁镜像继续声称自己来自旧提交
+
+### 第四步：创建 Cloudflare DNS
+
+```bash
+sudo CLOUDFLARE_API_TOKEN='<从密钥文件读取>' \
+  CLOUDFLARE_ZONE_NAME=example.com \
+  ROUTER_HOST=router.example.com \
+  ROUTER_TAILSCALE_IPV6=fd7a:115c:a1e0::1 \
+  bash deploy/scripts/upsert-cloudflare-dns.sh
+```
+
+Token 只需要目标 Zone 的 DNS Edit 和 Zone Read 权限；脚本只接受私有 Tailscale IPv6 地址，并创建 DNS-only AAAA 记录；没有 Tailnet 路由的设备即使能解析该地址也无法连接；它不会把 Router 接入 Cloudflare 公网代理
+
+### 第五步：签发证书
+
+先用 Cloudflare DNS challenge 签发证书，再安装引用证书的 Nginx 配置；这样不会出现“配置引用尚不存在证书”的启动失败
+
+```bash
+sudo certbot certonly --dns-cloudflare \
+  --dns-cloudflare-credentials /root-only/cloudflare.ini \
+  --dns-cloudflare-propagation-seconds 30 \
+  --domain router.example.com \
+  --non-interactive --agree-tos --email operator@example.com
+```
+
+Cloudflare SSL/TLS 模式必须为 Full (strict)
+
+### 第六步：登记 Authentik 应用
+
+```bash
+sudo AUTH_GATEWAY_APPS_FILE=/root-only/apps.json \
+  AUTH_GATEWAY_SERVICE=example-auth-gateway.service \
+  AUTH_GATEWAY_ENV_FILE=/root-only/aialra-auth-gateway.env \
+  AUTHENTIK_SERVER_CONTAINER=authentik-server \
+  ROUTER_HOST=router.example.com \
+  bash deploy/scripts/register-auth-gateway-app.sh
+```
+
+脚本先备份共享应用清单，再把 `https://router.example.com/_aialra_auth/callback` 作为严格匹配的授权回调加入统一 Authentik OAuth Provider；若服务重启、健康状态或回调登记失败，它会恢复原文件并再次启动共享网关；仅更新应用清单而未登记回调时，Authentik 会返回 `Redirect URI Error`
+
+### 第七步：生成并启用 Nginx
+
+```bash
+sudo ROUTER_HOST=router.example.com \
+  ROUTER_TAILSCALE_IPV4=100.64.0.10 \
+  ROUTER_TAILSCALE_IPV6=fd7a:115c:a1e0::1 \
+  NGINX_TEMPLATE="$PWD/deploy/nginx/router.conf.template" \
+  NGINX_OUTPUT=/etc/nginx/sites-available/router.example.com.conf \
+  EDGE_PROOF_SNIPPET=/etc/nginx/snippets/router-edge-proof.conf \
+  EDGE_PROXY_SECRET_FILE=/var/lib/routeloom/secrets/edge_proxy_secret \
+  AUTH_ENDPOINTS_SNIPPET=/etc/nginx/snippets/auth-endpoints.conf \
+  AUTH_PROTECT_SNIPPET=/etc/nginx/snippets/auth-protect.conf \
+  bash deploy/scripts/render-nginx.sh
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+两个地址都必须来自该 VPS 的 `tailscale ip`。DNS-only AAAA 记录指向 IPv6 时，Nginx 必须同时监听该 IPv6；只配置 IPv4 会让 IPv6 客户端落到其他默认虚拟主机，出现证书域名不匹配。不要用关闭 TLS 校验来绕过这个问题
+
+`nginx -t` 失败时不得重载；部署者应保留旧站点文件，并在新入口冒烟失败时恢复旧文件
+
+Next.js 为页面生成每请求 nonce 和 Content Security Policy；Nginx 不再叠加第二份页面 CSP
+
+### 第八步：完成专用 Codex 登录
+
+```bash
+sudo -u routeloom -H env CODEX_HOME=/var/lib/routeloom/codex codex login --device-auth
+sudo -u routeloom -H env CODEX_HOME=/var/lib/routeloom/codex codex login status
+```
+
+必须使用新的专用登录目录；不得复制或共享其他 Runner 正在使用的 `auth.json`
+
+随后运行恶意合成探针，证明 Runner 不能读取数据库密钥、正文主密钥、进程环境或 Codex 身份目录，也不能越过本次工作区；`restricted` 必须完全断网；`full` 只允许访问公开互联网，并由宿主机出口规则拒绝回环、私网、Tailnet、云元数据和其他 Docker 网段；任务结束后不得残留会话文件；任何一项失败都保持接单关闭
+
+出口规则同时写入 Runner 网络命名空间和宿主机防火墙；安装开机恢复服务，确保 VPS 或 Docker 重启后重新应用规则：
+
+```bash
+install -m 0644 deploy/systemd/routeloom-runner-egress.service \
+  /etc/systemd/system/routeloom-runner-egress.service
+systemctl daemon-reload
+systemctl enable routeloom-runner-egress.service
+```
+
+每次重新创建 Runner 后都要再次运行 `enable-codex-worker.sh`；脚本会先恢复出口规则并通过公开网络、私网和回环控制端点探针，再开放接单
+
+Codex 的 Linux 沙箱通过 `bubblewrap` 创建嵌套用户命名空间；Docker 默认 seccomp 会阻止所需的 `unshare(2)`；Ubuntu 24.04 还要求 AppArmor 明确允许非特权用户命名空间；启用 Worker 前先安装仓库内的专用配置：
+
+```bash
+sudo APPARMOR_PROFILE_SOURCE="$PWD/deploy/apparmor/routeloom-codex-worker" \
+  bash deploy/scripts/install-worker-apparmor.sh
+```
+
+Compose 仅对隔离 Runner 设置 `seccomp=unconfined` 和具名 `routeloom-codex-worker` 配置；受信 Worker 只消费队列并调用 Runner，不挂载 Codex 身份目录，也不接触容器引擎套接字；外层仍保留 `cap_drop: ALL`、`no-new-privileges`、只读根文件系统、专用非 root 用户、内部控制网络和资源上限
+
+### 第九步：启用唯一 Worker
+
+```bash
+sudo RELEASE_DIR=/srv/example/routeloom/releases/<commit> \
+  PRODUCTION_ENV=/var/lib/routeloom/production.env \
+  CODEX_AUTH_DIR=/var/lib/routeloom/codex \
+  bash deploy/scripts/enable-codex-worker.sh
+```
+
+脚本先启动 `codex` profile 中的隔离 Runner 与唯一受信 Worker；两者健康检查和攻击探针通过后，才把接单开关改为 true 并重启 API
+
+### 第十步：按需启动 ChatGPT 网页通道
+
+该步骤不会改变 Codex SDK 通道；网页通道默认关闭，真实网页探针通过前只能启动可见浏览器用于登录和诊断
+
+```bash
+# 启动当前发布中已验证的可见 Chromium 和受控出口代理，但保持网页任务接单关闭
+sudo ACTION=start \
+  RELEASE_DIR=/srv/example/routeloom/releases/<commit> \
+  PRODUCTION_ENV=/var/lib/routeloom/production.env \
+  bash deploy/scripts/enable-chatgpt-web.sh
+```
+
+从 Tailnet 访问 `https://router.example.com/chatgpt-browser/` 和 `https://router.example.com/chatgpt-browser-b/`；两个路径继续经过 Authentik，管理员在对应的可见 noVNC 页面分别手动登录、重新认证或处理验证码
+
+浏览器配置卷保存登录状态，按凭据处理并排除普通备份；浏览器容器不挂载数据库、正文主密钥、Codex 身份目录、宿主目录或容器套接字
+
+停止浏览器容器时需要给 Chromium 留出正常保存配置的时间；Compose 使用 30 秒停止宽限期，入口脚本先停止 Bridge 接单，再请求 Chromium 正常退出，最后才停止远程桌面进程
+
+部署完成后的容器健康只证明进程存在；账号能否接单还要同时检查页面、登录、探针、租约、发送间隔和冷却状态
+
+每个账号至少完成一次成功的 `single_probe` 真实任务后，才允许该账号加入网页池；每账号并发固定为 1，`full_10` 仍可用于强化观察，任何超时、限流、验证码、登录失效或不确定结果都不自动重试
+
+控制台只会在诊断模式开启时允许创建 readiness 或真实探针。生产接单模式下按钮会锁定，API 明确返回 `chatgpt_web_diagnostic_disabled`；先运行上面的 `ACTION=start` 进入诊断模式，不要把诊断入口关闭误判成账号失效
+
+`ACTION=start` 会预先启用浏览器内部 Bridge，但 API 和 Worker 仍拒绝网页任务；探针通过后的 `ACTION=enable` 只重载 API 和 Worker，不再重启 Chromium，避免开关切换使刚验证的登录态失效
+
+`ACTION=enable`、`ACTION=disable` 和 `ACTION=stop` 会先确认没有正在执行的任务或资格运行，避免重载 Worker 时打断已提交调用；重载后脚本会等待 API、就绪检查和 Worker 健康检查全部通过才返回成功，失败时自动恢复原开关并重新启动原控制面
+
+长 Codex 调用由 Runner 每 15 秒发送一次内部保活帧，保活帧不会进入用户结果、任务事件或用量记录；网页任务的数据库队列期限来自请求的 `deadlineMs`，另有 5 分钟结果落库余量，账号租约在任务存活期间自动续期
+
+`ACTION=start` 不执行镜像构建；镜像只应在正式发布阶段构建一次并以不可变摘要写入生产环境，避免每次重新登录或诊断都制造大体积构建缓存
+
+```bash
+# 真实网页探针通过后才把 CHATGPT_WEB_ADAPTER_ENABLED 切换为 true
+sudo ACTION=enable \
+  RELEASE_DIR=/srv/example/routeloom/releases/<commit> \
+  PRODUCTION_ENV=/var/lib/routeloom/production.env \
+  bash deploy/scripts/enable-chatgpt-web.sh
+```
+
+网页浏览器默认使用独立的 `/28` 控制、代理和出口子网，避免共享宿主已有的 Docker 地址池；Nginx 通过控制网中的固定地址 `CHATGPT_BROWSER_CONTROL_IP`、`_B`、`_C`、`_D` 访问各账号 noVNC，浏览器没有宿主端口；如果部署主机已经使用这些网段，请同时覆盖固定地址和三个子网，并先确认它们不与宿主路由、Tailnet 路由或其他容器网络重叠
+
+默认保留 Chromium 自身沙箱；如果宿主明确阻止非特权用户命名空间，日志会出现 `No usable sandbox`，可以只在网页通道保持关闭时临时设置 `CHATGPT_CHROMIUM_NO_SANDBOX=true` 完成可见登录探针；该降级会削弱浏览器内部隔离，不应作为公开模板的默认值，也不能替代只读根文件系统、非 root 用户、零额外权限和受控出口
+
+完整边界、调用案例、错误和停用方法见[ChatGPT 网页通道](chatgpt-web-experiment.md)
+
+## 1.3 上线验收
+
+- 公网 IP 无法连接 Router 的 80 或 443 端口，Tailnet 内可以完成 TLS 握手
+- 根路径不提供公开展示面，直接进入 Authentik 登录
+- 未登录访问 `/console` 会进入 Authentik；正常登录后可以切页
+- 缺少 Router 专用 Authentik Group 或伪造 `X-Aialra-*` 头时均失败
+- 作用域 API 密钥可以读取模型并创建一个合成任务；吊销后立即失败
+- 实际 Luna 测试任务返回预期结果，额度快照不是固定 0
+- Nginx 下无 CSP 错误，控制台可以创建密钥和提交任务
+- 现有 Authentik 站点在变更前后都能正常登录
+- 重启后任务不丢失；24 小时后正文与事件已删除
+- 网页通道关闭时，网页请求被拒绝且 Codex 调用不受影响
+- 网页通道开启前，每个生产账号完成无消息就绪检查和一次成功的 `single_probe`，并保持 0 次重复发送和 0 次错误归属
+- 浏览器无法访问回环、私网、Tailnet、云元数据、数据库和 Codex 身份目录
+- ChatGPT 网页显示验证或账号警告时，系统停止网页接单并等待管理员处理
+
+## 1.4 备份与回滚
+
+`backup.sh` 从 PostgreSQL 容器流式导出并用 age 加密，不把数据库 URL 放进进程参数；加密产物仍需复制到独立故障域；只保存在同一 VPS 不算完整备份
+
+安装 `deploy/systemd/` 中的服务和定时器后，执行 `systemctl enable --now routeloom-backup.timer`；服务以 root 运行是因为需要访问 Docker socket 和 root-only 收件人文件；它通过 `ProtectSystem=strict`、`NoNewPrivileges`、`PrivateTmp` 和仅允许写入备份目录限制文件访问；首次启用后必须手动启动一次服务，并检查生成的 `.dump.age` 文件非空
+
+回滚顺序：先关闭接单，排空 Worker，恢复上一镜像或上一 release，运行 `nginx -t`，再重载入口；数据库迁移持有 advisory lock 并记录版本；回滚不得删除已接任务

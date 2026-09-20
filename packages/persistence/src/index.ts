@@ -1,0 +1,3604 @@
+import { createHash, randomUUID } from "node:crypto";
+
+import {
+  ChatGptWebAccountSchema,
+  type ExecutionChannel,
+  type ExecutionPolicy,
+  type ChatGptWebAccount,
+  type ChatGptWebAccountPlan,
+  type ChatGptWebAccountState,
+  ChatGptWebQualificationRunSchema,
+  type ChatGptWebQualificationRun,
+  ChatGptWebStatusSchema,
+  type ChatGptWebStatus,
+  parseLegacyValidationCheck,
+  TaskContractSchema,
+  UsageLedgerSchema,
+  type Job,
+  type JobEvent,
+  JobStatusSchema,
+  type JobStatus,
+  type ModelCatalogSnapshot,
+  type QuotaSnapshot,
+  type SessionThread,
+  type ValidationResult,
+} from "@aialra/contracts";
+import { decryptRecord, encryptRecord, isEncryptedRecord } from "@aialra/security";
+import pg from "pg";
+
+const { Pool } = pg;
+
+export function defaultChatGptWebStatus(now = new Date()): ChatGptWebStatus {
+  return {
+    configuredEnabled: false,
+    diagnosticEnabled: false,
+    effectiveConcurrency: 0,
+    maximumConcurrency: 1,
+    activeTabs: 0,
+    queuedJobs: 0,
+    sandboxVerified: false,
+    extensionConnected: false,
+    pageReady: false,
+    authenticated: false,
+    circuitState: "qualification_required",
+    circuitReason: "qualification_not_completed",
+    cooldownUntil: null,
+    rateLimitState: "clear",
+    retryAfter: null,
+    lastRateLimitAt: null,
+    consecutiveRateLimits: 0,
+    conversationMode: "temporary_per_request",
+    temporaryChatVerified: false,
+    lastRecoveryProbeAt: null,
+    lastRecoveryProbePassed: null,
+    lastSubmissionAt: null,
+    successesAtCurrentLevel: 0,
+    attemptsAtCurrentLevel: 0,
+    severeErrorsAtCurrentLevel: 0,
+    lastQualifiedAt: null,
+    lastQualificationPassed: null,
+    lastQualificationSucceeded: null,
+    adapterVersion: "single-page-v1",
+    phase: "idle",
+    activeJobId: null,
+    activeAttempt: null,
+    lastHeartbeatAt: null,
+    lastFailureCode: null,
+    lastResetAt: null,
+    quarantinedTabs: 0,
+    slots: [],
+    accounts: [],
+    lastQualificationRunId: null,
+    updatedAt: now.toISOString(),
+  };
+}
+
+export type ChatGptWebAccountConfig = {
+  accountId: ChatGptWebAccount["accountId"];
+  slot: ChatGptWebAccount["slot"];
+  bridgeUrl: string;
+  vncPath: ChatGptWebAccount["vncPath"];
+};
+
+export type ChatGptWebAccountRecord = ChatGptWebAccount & { bridgeUrl: string };
+
+export type ChatGptWebAccountPatch = Partial<ChatGptWebAccount>;
+
+const CHATGPT_WEB_ACCOUNT_SLOTS = ["a", "b", "c", "d"] as const;
+
+export function equalChatGptWebRoutingWeights(accountIds: string[]): Record<string, number> {
+  const sorted = [...new Set(accountIds)].sort();
+  if (!sorted.length) return {};
+  const base = Math.floor(100 / sorted.length);
+  let remainder = 100 - base * sorted.length;
+  return Object.fromEntries(
+    sorted.map((accountId) => [accountId, base + (remainder-- > 0 ? 1 : 0)]),
+  );
+}
+
+export function selectWeightedChatGptWebAccount(
+  jobId: string,
+  candidates: ChatGptWebAccountRecord[],
+): ChatGptWebAccountRecord | null {
+  return rankWeightedChatGptWebAccounts(jobId, candidates)[0] ?? null;
+}
+
+function rankWeightedChatGptWebAccounts(
+  jobId: string,
+  candidates: ChatGptWebAccountRecord[],
+): ChatGptWebAccountRecord[] {
+  const score = (candidate: ChatGptWebAccountRecord) => {
+    const hash = createHash("sha256").update(`${jobId}:${candidate.accountId}`).digest();
+    const uniform = (hash.readUInt32BE(0) + 1) / 4_294_967_297;
+    return -Math.log(uniform) / Math.max(1, candidate.routingWeight);
+  };
+  const sortByScore = (left: ChatGptWebAccountRecord, right: ChatGptWebAccountRecord) =>
+    score(left) - score(right) || left.slot.localeCompare(right.slot);
+  const positive = candidates.filter((candidate) => candidate.routingWeight > 0).sort(sortByScore);
+  const fallback = candidates
+    .filter((candidate) => candidate.routingWeight === 0)
+    .sort(sortByScore);
+  return positive.length ? [...positive, ...fallback] : fallback;
+}
+
+function assertRoutingWeights(
+  accounts: ChatGptWebAccountRecord[],
+  weights: Record<string, number>,
+): void {
+  const expected = accounts.map((account) => account.accountId).sort();
+  const received = Object.keys(weights).sort();
+  if (
+    expected.length !== received.length ||
+    expected.some((accountId, index) => accountId !== received[index])
+  ) {
+    throw new Error("chatgpt_web_routing_accounts_mismatch");
+  }
+  if (
+    received.some(
+      (accountId) =>
+        !Number.isInteger(weights[accountId]) ||
+        (weights[accountId] ?? -1) < 0 ||
+        (weights[accountId] ?? 101) > 100,
+    ) ||
+    received.reduce((total, accountId) => total + (weights[accountId] ?? 0), 0) !== 100
+  ) {
+    throw new Error("chatgpt_web_routing_weight_total_invalid");
+  }
+}
+
+export function configuredChatGptWebAccountConfigs(
+  raw = process.env.CHATGPT_WEB_POOL_SLOTS,
+): ChatGptWebAccountConfig[] {
+  const requested = (raw ?? "a,b")
+    .split(",")
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean);
+  const slots = [...new Set(requested)];
+  if (
+    !slots.length ||
+    slots.some(
+      (slot): slot is (typeof CHATGPT_WEB_ACCOUNT_SLOTS)[number] =>
+        !CHATGPT_WEB_ACCOUNT_SLOTS.includes(slot as (typeof CHATGPT_WEB_ACCOUNT_SLOTS)[number]),
+    )
+  ) {
+    throw new Error("chatgpt_web_pool_slots_invalid");
+  }
+  return slots.map((slot) => {
+    const suffix = slot === "a" ? "" : `-${slot}`;
+    return {
+      accountId: `account-${slot}` as ChatGptWebAccount["accountId"],
+      slot: slot as ChatGptWebAccount["slot"],
+      bridgeUrl: `http://chatgpt-browser${suffix}:13216`,
+      vncPath: `/chatgpt-browser${suffix}/` as ChatGptWebAccount["vncPath"],
+    };
+  });
+}
+
+function defaultChatGptWebAccount(
+  config: ChatGptWebAccountConfig,
+  now = new Date(),
+): ChatGptWebAccountRecord {
+  const updatedAt = now.toISOString();
+  const account = ChatGptWebAccountSchema.parse({
+    accountId: config.accountId,
+    slot: config.slot,
+    label: `账号 ${config.slot.toUpperCase()}`,
+    plan: "unknown" satisfies ChatGptWebAccountPlan,
+    enabled: false,
+    qualified: false,
+    state: "login_required" satisfies ChatGptWebAccountState,
+    maxConcurrency: 1,
+    extensionConnected: false,
+    pageReady: false,
+    authenticated: false,
+    sandboxVerified: false,
+    activeJobId: null,
+    leaseExpiresAt: null,
+    leaseEpoch: 0,
+    stateVersion: 0,
+    rateLimitState: "clear",
+    retryAfter: null,
+    consecutiveRateLimits: 0,
+    lastRateLimitAt: null,
+    lastSubmissionAt: null,
+    lastHeartbeatAt: null,
+    lastProbeAt: null,
+    lastProbePassed: null,
+    lastSuccessAt: null,
+    lastFailureAt: null,
+    lastFailureCode: null,
+    failurePhase: null,
+    diagnosticSummary: null,
+    vncPath: config.vncPath,
+    updatedAt,
+  });
+  return { ...account, bridgeUrl: config.bridgeUrl };
+}
+
+function accountStatusWithoutBridge(
+  account: ChatGptWebAccount | ChatGptWebAccountRecord,
+): ChatGptWebAccount {
+  const status = { ...account } as Record<string, unknown>;
+  delete status.bridgeUrl;
+  return ChatGptWebAccountSchema.parse(status);
+}
+
+export function parseChatGptWebStatus(value: unknown, now = new Date()): ChatGptWebStatus {
+  const stored = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+  return ChatGptWebStatusSchema.parse({
+    ...defaultChatGptWebStatus(now),
+    ...stored,
+  });
+}
+
+function classifyLegacyReview(
+  taskValue: unknown,
+  output: unknown,
+  storedValidation: ValidationResult | null,
+  errorCode: string | null,
+): {
+  status: "succeeded" | "failed" | "cancelled";
+  validation: ValidationResult | null;
+  errorCode: string | null;
+  errorMessage: string | null;
+} {
+  if (errorCode === "approval_required" || errorCode === "approval_denied") {
+    return {
+      status: "cancelled",
+      validation: storedValidation,
+      errorCode: "approval_denied",
+      errorMessage: "The execution permission was not granted.",
+    };
+  }
+  if (output === null) {
+    return {
+      status: "failed",
+      validation: storedValidation,
+      errorCode: errorCode ?? "legacy_review_failed",
+      errorMessage: "The historical call did not produce an output that could be validated.",
+    };
+  }
+  const task = TaskContractSchema.parse(taskValue);
+  const text = typeof output === "string" ? output : JSON.stringify(output);
+  const messages: string[] = [];
+  let passed = !task.validation.responseSchema || storedValidation?.schemaPassed === true;
+  let testsPassed = 0;
+  let testsFailed = 0;
+  for (const rule of task.validation.acceptanceTests) {
+    const check = parseLegacyValidationCheck(rule, true);
+    const checkPassed =
+      check?.type === "equals"
+        ? (check.trim ? text.trim() : text) ===
+          (check.trim ? check.expected.trim() : check.expected)
+        : check?.type === "contains"
+          ? text.includes(check.expected)
+          : false;
+    if (checkPassed) testsPassed += 1;
+    else {
+      testsFailed += 1;
+      messages.push(check ? `legacy_validation_failed:${rule}` : `invalid_validation_rule:${rule}`);
+    }
+  }
+  for (const check of task.validation.checks) {
+    const checkPassed =
+      check.type === "equals"
+        ? (check.trim ? text.trim() : text) ===
+          (check.trim ? check.expected.trim() : check.expected)
+        : text.includes(check.expected);
+    if (checkPassed) testsPassed += 1;
+    else {
+      testsFailed += 1;
+      messages.push(`${check.type}_failed`);
+    }
+  }
+  passed = passed && testsFailed === 0;
+  const validation: ValidationResult = {
+    passed,
+    schemaPassed: task.validation.responseSchema ? (storedValidation?.schemaPassed ?? false) : null,
+    testsPassed,
+    testsFailed,
+    messages,
+  };
+  return passed
+    ? { status: "succeeded", validation, errorCode: null, errorMessage: null }
+    : {
+        status: "failed",
+        validation,
+        errorCode: "validation_failed",
+        errorMessage: "The historical output did not satisfy its declared validation rules.",
+      };
+}
+
+const HISTORICAL_STATUS_BY_AUDIT_ACTION: Readonly<Record<string, JobStatus>> = {
+  "job.created": "accepted",
+  "job.awaiting_approval": "awaiting_approval",
+  "job.queued": "queued",
+  "job.queued_after_approval": "queued",
+  "job.approval_denied": "cancelled",
+  "job.cancelled": "cancelled",
+  "worker.running": "running",
+  "worker.validating": "validating",
+  "worker.succeeded": "succeeded",
+  "worker.failed": "failed",
+  "worker.provider_unavailable": "failed",
+  "worker.session_expired": "failed",
+  "worker.expired": "expired",
+};
+
+export type HistoricalAuditStatusRecord = {
+  action: string;
+  createdAt: string;
+};
+
+export type HistoricalJobEventRecovery = {
+  events: Array<{
+    status: JobStatus;
+    createdAt: string;
+    data: Record<string, unknown>;
+    source: "audit_events" | "jobs.status";
+  }>;
+  auditDerivedEvents: number;
+  currentStatusEvents: number;
+  ignoredAuditActions: number;
+  hasUnresolvedHistory: boolean;
+};
+
+export function reconstructHistoricalJobEventData(
+  currentStatus: JobStatus,
+  updatedAt: string,
+  auditEvents: readonly HistoricalAuditStatusRecord[],
+): HistoricalJobEventRecovery {
+  const events: HistoricalJobEventRecovery["events"] = [];
+  let ignoredAuditActions = 0;
+  const orderedAudits = [...auditEvents].sort((left, right) =>
+    left.createdAt.localeCompare(right.createdAt),
+  );
+  for (const audit of orderedAudits) {
+    const status = HISTORICAL_STATUS_BY_AUDIT_ACTION[audit.action];
+    if (!status) {
+      ignoredAuditActions += 1;
+      continue;
+    }
+    events.push({
+      status,
+      createdAt: audit.createdAt,
+      data: {
+        status,
+        historicalRecovery: true,
+        reconstructedFrom: "audit_events",
+        sourceAction: audit.action,
+      },
+      source: "audit_events",
+    });
+  }
+  const currentStatusMatches = events.at(-1)?.status === currentStatus;
+  if (!currentStatusMatches) {
+    events.push({
+      status: currentStatus,
+      createdAt: updatedAt,
+      data: {
+        status: currentStatus,
+        historicalRecovery: true,
+        reconstructedFrom: "jobs.status",
+      },
+      source: "jobs.status",
+    });
+  }
+  return {
+    events,
+    auditDerivedEvents: events.filter((event) => event.source === "audit_events").length,
+    currentStatusEvents: events.filter((event) => event.source === "jobs.status").length,
+    ignoredAuditActions,
+    hasUnresolvedHistory: !currentStatusMatches || ignoredAuditActions > 0,
+  };
+}
+
+export type HistoricalJobEventRecoveryReport = {
+  version: 4;
+  candidateJobs: number;
+  insertedEvents: number;
+  auditDerivedEvents: number;
+  currentStatusEvents: number;
+  jobsWithUnresolvedHistory: number;
+  ignoredAuditActions: number;
+};
+
+export interface StoredApiKey {
+  id: string;
+  createdBy: string;
+  name: string;
+  prefix: string;
+  digest: string;
+  scopes: string[];
+  executionChannels: ExecutionChannel[];
+  executionPolicy: ExecutionPolicy;
+  rateLimitPerMinute: number;
+  expiresAt: string | null;
+  revokedAt: string | null;
+  createdAt: string;
+  lastUsedAt: string | null;
+}
+
+export interface ApiKeyCreationResult {
+  record: StoredApiKey;
+  plaintext: string;
+  replayed: boolean;
+}
+
+export type ApiKeyMetadata = Omit<StoredApiKey, "digest" | "createdBy">;
+
+function apiKeyWithoutDigest(record: StoredApiKey): ApiKeyMetadata {
+  return {
+    id: record.id,
+    name: record.name,
+    prefix: record.prefix,
+    scopes: record.scopes,
+    executionChannels: [...record.executionChannels],
+    executionPolicy: structuredClone(record.executionPolicy),
+    rateLimitPerMinute: record.rateLimitPerMinute,
+    expiresAt: record.expiresAt,
+    revokedAt: record.revokedAt,
+    createdAt: record.createdAt,
+    lastUsedAt: record.lastUsedAt,
+  };
+}
+
+export interface IdentityUser {
+  id: string;
+  email: string;
+  displayName: string;
+  createdAt: string;
+}
+
+export interface StoredPasskey {
+  id: string;
+  userId: string;
+  credentialId: string;
+  publicKeyBase64: string;
+  counter: number;
+  transports: string[];
+  deviceType: string;
+  backedUp: boolean;
+  createdAt: string;
+}
+
+export interface AuthChallenge {
+  id: string;
+  userId: string;
+  purpose: "registration" | "authentication";
+  challenge: string;
+  expiresAt: string;
+  usedAt: string | null;
+}
+
+export interface AuthSession {
+  id: string;
+  userId: string;
+  digest: string;
+  expiresAt: string;
+  createdAt: string;
+}
+
+export interface RecoveryCodeRecord {
+  id: string;
+  userId: string;
+  digest: string;
+  createdAt: string;
+  usedAt: string | null;
+}
+
+export interface AuditEvent {
+  id: string;
+  actorId: string;
+  action: string;
+  resourceType: string;
+  resourceId: string | null;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+}
+
+export interface TransactionalSql {
+  executeSql(text: string, values?: unknown[]): Promise<{ rows: unknown[] }>;
+}
+
+export interface InitialJobTransition {
+  status: Extract<Job["status"], "queued" | "awaiting_approval">;
+  audit: AuditEvent;
+  events?: Array<{
+    type: JobEvent["type"];
+    data: Record<string, unknown>;
+    createdAt?: string;
+  }>;
+  enqueue?: (transaction: TransactionalSql) => Promise<void>;
+}
+
+export interface InitialJobResult {
+  job: Job;
+  created: boolean;
+}
+
+export type ChatGptWebSubmitIntentState =
+  "prepared" | "command_accepted" | "action_started" | "echo_verified" | "completed" | "failed";
+
+export interface ChatGptWebSubmitIntent {
+  intentId: string;
+  jobId: string;
+  accountId: string;
+  leaseEpoch: number;
+  state: ChatGptWebSubmitIntentState;
+  phaseSequence: number;
+  deadlineAt: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface DeletionReceipt {
+  id: string;
+  jobId: string;
+  payloadDeletedAt: string;
+  metadataDeleteAfter: string;
+}
+
+export interface ModelSetting {
+  modelId: string;
+  enabled: boolean;
+  updatedAt: string;
+  updatedBy: string;
+}
+
+export interface ModelSettingResult {
+  setting: ModelSetting;
+  replayed: boolean;
+}
+
+export interface JobRepository {
+  create(job: Job): Promise<Job>;
+  createInitialJob(
+    job: Job,
+    creationAudit: AuditEvent,
+    transition: InitialJobTransition,
+  ): Promise<InitialJobResult>;
+  findById(id: string): Promise<Job | null>;
+  findByIdempotency(callerId: string, key: string): Promise<Job | null>;
+  list(limit?: number): Promise<Job[]>;
+  update(id: string, patch: Partial<Job>): Promise<Job>;
+  transitionJob(
+    id: string,
+    patch: Partial<Job>,
+    audit: AuditEvent,
+    enqueue?: (transaction: TransactionalSql) => Promise<void>,
+  ): Promise<Job>;
+  claimJobForExecution(id: string, audit: AuditEvent): Promise<Job | null>;
+  expireRunningJob(id: string, audit: AuditEvent): Promise<Job | null>;
+  appendEvent(
+    jobId: string,
+    type: JobEvent["type"],
+    data: Record<string, unknown>,
+  ): Promise<JobEvent>;
+  events(jobId: string, afterSequence?: number): Promise<JobEvent[]>;
+  eventsForJobs(jobIds: string[]): Promise<Map<string, JobEvent[]>>;
+  saveQuotaSnapshot(snapshot: QuotaSnapshot): Promise<void>;
+  latestQuotaSnapshot(): Promise<QuotaSnapshot | null>;
+  saveModelCatalog(snapshot: ModelCatalogSnapshot): Promise<void>;
+  latestModelCatalog(): Promise<ModelCatalogSnapshot | null>;
+  readChatGptWebStatus(): Promise<ChatGptWebStatus>;
+  saveChatGptWebStatus(status: ChatGptWebStatus): Promise<void>;
+  listChatGptWebAccounts(): Promise<ChatGptWebAccountRecord[]>;
+  findChatGptWebAccount(accountId: string): Promise<ChatGptWebAccountRecord | null>;
+  syncChatGptWebAccounts(configs: ChatGptWebAccountConfig[]): Promise<void>;
+  updateChatGptWebAccount(
+    accountId: string,
+    patch: ChatGptWebAccountPatch,
+  ): Promise<ChatGptWebAccountRecord>;
+  updateChatGptWebRoutingWeights(
+    weights: Record<string, number>,
+  ): Promise<ChatGptWebAccountRecord[]>;
+  acquireChatGptWebAccountLease(
+    jobId: string,
+    accountIds: string[],
+    now: Date,
+    leaseMs: number,
+  ): Promise<ChatGptWebAccountRecord | null>;
+  renewChatGptWebAccountLease(
+    accountId: string,
+    jobId: string,
+    leaseEpoch: number,
+    now: Date,
+    leaseMs: number,
+  ): Promise<boolean>;
+  releaseChatGptWebAccountLease(
+    accountId: string,
+    jobId: string,
+    leaseEpoch: number,
+    patch?: ChatGptWebAccountPatch,
+  ): Promise<ChatGptWebAccountRecord | null>;
+  createChatGptWebSubmitIntent(intent: ChatGptWebSubmitIntent): Promise<ChatGptWebSubmitIntent>;
+  advanceChatGptWebSubmitIntent(
+    intentId: string,
+    leaseEpoch: number,
+    state: ChatGptWebSubmitIntentState,
+    phaseSequence: number,
+  ): Promise<boolean>;
+  createChatGptWebQualificationRun(
+    run: ChatGptWebQualificationRun,
+  ): Promise<ChatGptWebQualificationRun>;
+  findChatGptWebQualificationRun(id: string): Promise<ChatGptWebQualificationRun | null>;
+  updateChatGptWebQualificationRun(
+    id: string,
+    patch: Partial<ChatGptWebQualificationRun>,
+  ): Promise<ChatGptWebQualificationRun>;
+  listChatGptWebQualificationRuns(limit?: number): Promise<ChatGptWebQualificationRun[]>;
+  listModelSettings(): Promise<ModelSetting[]>;
+  setModelEnabled(modelId: string, enabled: boolean, actorId: string): Promise<ModelSetting>;
+  setModelEnabledIdempotent(
+    modelId: string,
+    enabled: boolean,
+    actorId: string,
+    idempotencyKey: string,
+    requestHash: string,
+  ): Promise<ModelSettingResult>;
+  upsertSessionThread(thread: SessionThread): Promise<SessionThread>;
+  findSessionThread(sessionKey: string): Promise<SessionThread | null>;
+  listSessionThreads(actorId: string, isAdmin: boolean, limit?: number): Promise<SessionThread[]>;
+  deleteExpiredSessionThreads(now: Date): Promise<number>;
+  createApiKey(record: StoredApiKey): Promise<StoredApiKey>;
+  createApiKeyIdempotent(
+    actorId: string,
+    idempotencyKey: string,
+    requestHash: string,
+    record: StoredApiKey,
+    plaintext: string,
+  ): Promise<ApiKeyCreationResult>;
+  findApiKeyByPrefix(prefix: string): Promise<StoredApiKey | null>;
+  findApiKeyById(id: string): Promise<StoredApiKey | null>;
+  listApiKeys(): Promise<ApiKeyMetadata[]>;
+  listApiKeysForActor(actorId: string, isAdmin: boolean): Promise<ApiKeyMetadata[]>;
+  touchApiKey(id: string): Promise<void>;
+  revokeApiKey(id: string): Promise<void>;
+  apiKeyCount(): Promise<number>;
+  activeAdminApiKeyCount(): Promise<number>;
+  consumeRateLimit(subject: string, limit: number, now: Date): Promise<boolean>;
+  createUser(user: IdentityUser): Promise<IdentityUser>;
+  findUserByEmail(email: string): Promise<IdentityUser | null>;
+  findUserById(id: string): Promise<IdentityUser | null>;
+  userCount(): Promise<number>;
+  createPasskey(passkey: StoredPasskey): Promise<void>;
+  passkeysForUser(userId: string): Promise<StoredPasskey[]>;
+  findPasskey(credentialId: string): Promise<StoredPasskey | null>;
+  updatePasskeyCounter(id: string, counter: number): Promise<void>;
+  createChallenge(challenge: AuthChallenge): Promise<void>;
+  consumeChallenge(id: string): Promise<AuthChallenge | null>;
+  createSession(session: AuthSession): Promise<void>;
+  findSessionByDigest(digest: string): Promise<AuthSession | null>;
+  deleteSessionByDigest(digest: string): Promise<boolean>;
+  createRecoveryCodes(records: RecoveryCodeRecord[]): Promise<void>;
+  consumeRecoveryCode(userId: string, digest: string): Promise<boolean>;
+  appendAudit(event: AuditEvent): Promise<void>;
+  listAudit(limit?: number): Promise<AuditEvent[]>;
+  listDeletionReceipts(limit?: number): Promise<DeletionReceipt[]>;
+  deleteExpiredPayloads(now: Date): Promise<number>;
+  deleteExpiredMetadata(now: Date): Promise<number>;
+}
+
+export class InMemoryJobRepository implements JobRepository {
+  private readonly jobs = new Map<string, Job>();
+  private readonly eventMap = new Map<string, JobEvent[]>();
+  private quotaSnapshot: QuotaSnapshot | null = null;
+  private modelCatalog: ModelCatalogSnapshot | null = null;
+  private chatGptWebStatus: ChatGptWebStatus = defaultChatGptWebStatus();
+  private readonly chatGptWebAccounts = new Map<string, ChatGptWebAccountRecord>();
+  private chatGptWebAccountLeaseTail: Promise<void> = Promise.resolve();
+  private readonly chatGptWebQualificationRuns = new Map<string, ChatGptWebQualificationRun>();
+  private readonly chatGptWebSubmitIntents = new Map<string, ChatGptWebSubmitIntent>();
+  private readonly modelSettings = new Map<string, ModelSetting>(
+    ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"].map((modelId) => [
+      modelId,
+      { modelId, enabled: true, updatedAt: new Date(0).toISOString(), updatedBy: "migration" },
+    ]),
+  );
+  private readonly modelSettingRequests = new Map<
+    string,
+    { requestHash: string; setting: ModelSetting }
+  >();
+  private readonly sessionThreads = new Map<string, SessionThread>();
+  private readonly apiKeys = new Map<string, StoredApiKey>();
+  private readonly apiKeyRequests = new Map<
+    string,
+    { requestHash: string; record: StoredApiKey; plaintext: string }
+  >();
+  private readonly users = new Map<string, IdentityUser>();
+  private readonly passkeys = new Map<string, StoredPasskey>();
+  private readonly challenges = new Map<string, AuthChallenge>();
+  private readonly sessions = new Map<string, AuthSession>();
+  private readonly recoveryCodes = new Map<string, RecoveryCodeRecord>();
+  private readonly auditEvents: AuditEvent[] = [];
+  private readonly deletionReceipts = new Map<string, DeletionReceipt>();
+  private readonly rateLimits = new Map<string, { minute: number; count: number }>();
+
+  async create(job: Job): Promise<Job> {
+    if (job.idempotencyKey) {
+      const existing = [...this.jobs.values()].find(
+        (candidate) =>
+          candidate.callerId === job.callerId && candidate.idempotencyKey === job.idempotencyKey,
+      );
+      if (existing) return structuredClone(existing);
+    }
+    this.jobs.set(job.id, structuredClone(job));
+    return structuredClone(job);
+  }
+
+  async createInitialJob(
+    job: Job,
+    creationAudit: AuditEvent,
+    transition: InitialJobTransition,
+  ): Promise<InitialJobResult> {
+    const existing = job.idempotencyKey
+      ? [...this.jobs.values()].find(
+          (candidate) =>
+            candidate.callerId === job.callerId && candidate.idempotencyKey === job.idempotencyKey,
+        )
+      : null;
+    if (existing) return { job: existing, created: false };
+
+    const auditLength = this.auditEvents.length;
+    try {
+      this.jobs.set(job.id, structuredClone(job));
+      await this.appendAudit(creationAudit);
+      await this.appendEvent(job.id, "status", { status: "accepted" });
+      const updated = {
+        ...job,
+        status: transition.status,
+        updatedAt: new Date().toISOString(),
+      };
+      this.jobs.set(job.id, structuredClone(updated));
+      await this.appendEvent(job.id, "status", { status: transition.status });
+      for (const event of transition.events ?? []) {
+        await this.appendEvent(job.id, event.type, event.data);
+      }
+      await this.appendAudit(transition.audit);
+      await transition.enqueue?.({
+        executeSql: async () => ({ rows: [] }),
+      });
+      return { job: structuredClone(updated), created: true };
+    } catch (error) {
+      this.jobs.delete(job.id);
+      this.eventMap.delete(job.id);
+      this.auditEvents.splice(auditLength);
+      throw error;
+    }
+  }
+
+  async findById(id: string): Promise<Job | null> {
+    const job = this.jobs.get(id);
+    return job ? structuredClone(job) : null;
+  }
+
+  async findByIdempotency(callerId: string, key: string): Promise<Job | null> {
+    const job = [...this.jobs.values()].find(
+      (candidate) => candidate.callerId === callerId && candidate.idempotencyKey === key,
+    );
+    return job ? structuredClone(job) : null;
+  }
+
+  async list(limit = 100): Promise<Job[]> {
+    return [...this.jobs.values()]
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+      .slice(0, limit)
+      .map((job) => structuredClone(job));
+  }
+
+  async update(id: string, patch: Partial<Job>): Promise<Job> {
+    const current = this.jobs.get(id);
+    if (!current) {
+      throw new Error("job_not_found");
+    }
+
+    const updated = { ...current, ...structuredClone(patch), updatedAt: new Date().toISOString() };
+    this.jobs.set(id, updated);
+    return structuredClone(updated);
+  }
+
+  async transitionJob(
+    id: string,
+    patch: Partial<Job>,
+    audit: AuditEvent,
+    enqueue?: (transaction: TransactionalSql) => Promise<void>,
+  ): Promise<Job> {
+    if (!patch.status) throw new Error("job_status_required");
+    const current = this.jobs.get(id);
+    if (!current) throw new Error("job_not_found");
+    const previousEvents = structuredClone(this.eventMap.get(id) ?? []);
+    const auditLength = this.auditEvents.length;
+    try {
+      const updated = await this.update(id, patch);
+      await this.appendEvent(id, "status", { status: patch.status });
+      await this.appendAudit(audit);
+      await enqueue?.({ executeSql: async () => ({ rows: [] }) });
+      return updated;
+    } catch (error) {
+      this.jobs.set(id, current);
+      this.eventMap.set(id, previousEvents);
+      this.auditEvents.splice(auditLength);
+      throw error;
+    }
+  }
+
+  async claimJobForExecution(id: string, audit: AuditEvent): Promise<Job | null> {
+    const current = this.jobs.get(id);
+    if (!current || current.status !== "queued") return null;
+    return this.transitionJob(id, { status: "running" }, audit);
+  }
+
+  async expireRunningJob(id: string, audit: AuditEvent): Promise<Job | null> {
+    const current = this.jobs.get(id);
+    if (!current || current.status !== "running") return null;
+    return this.transitionJob(
+      id,
+      {
+        status: "expired",
+        errorCode: "worker_execution_interrupted",
+        errorMessage: "The Worker stopped before it could record a terminal provider result.",
+      },
+      audit,
+    );
+  }
+
+  async appendEvent(
+    jobId: string,
+    type: JobEvent["type"],
+    data: Record<string, unknown>,
+  ): Promise<JobEvent> {
+    const events = this.eventMap.get(jobId) ?? [];
+    const event: JobEvent = {
+      id: randomUUID(),
+      jobId,
+      sequence: events.length,
+      type,
+      data: structuredClone(data),
+      createdAt: new Date().toISOString(),
+    };
+    events.push(event);
+    this.eventMap.set(jobId, events);
+    return structuredClone(event);
+  }
+
+  async events(jobId: string, afterSequence = -1): Promise<JobEvent[]> {
+    return (this.eventMap.get(jobId) ?? [])
+      .filter((event) => event.sequence > afterSequence)
+      .map((event) => structuredClone(event));
+  }
+
+  async eventsForJobs(jobIds: string[]): Promise<Map<string, JobEvent[]>> {
+    return new Map(
+      jobIds.map((jobId) => [
+        jobId,
+        (this.eventMap.get(jobId) ?? []).map((event) => structuredClone(event)),
+      ]),
+    );
+  }
+
+  async saveQuotaSnapshot(snapshot: QuotaSnapshot): Promise<void> {
+    this.quotaSnapshot = structuredClone(snapshot);
+  }
+
+  async latestQuotaSnapshot(): Promise<QuotaSnapshot | null> {
+    return this.quotaSnapshot ? structuredClone(this.quotaSnapshot) : null;
+  }
+
+  async saveModelCatalog(snapshot: ModelCatalogSnapshot): Promise<void> {
+    this.modelCatalog = structuredClone(snapshot);
+  }
+
+  async latestModelCatalog(): Promise<ModelCatalogSnapshot | null> {
+    return this.modelCatalog ? structuredClone(this.modelCatalog) : null;
+  }
+
+  async readChatGptWebStatus(): Promise<ChatGptWebStatus> {
+    return structuredClone(this.chatGptWebStatus);
+  }
+
+  async saveChatGptWebStatus(status: ChatGptWebStatus): Promise<void> {
+    this.chatGptWebStatus = parseChatGptWebStatus(structuredClone(status));
+  }
+
+  async listChatGptWebAccounts(): Promise<ChatGptWebAccountRecord[]> {
+    return [...this.chatGptWebAccounts.values()]
+      .sort((left, right) => left.slot.localeCompare(right.slot))
+      .map((account) => structuredClone(account));
+  }
+
+  async findChatGptWebAccount(accountId: string): Promise<ChatGptWebAccountRecord | null> {
+    const account = this.chatGptWebAccounts.get(accountId);
+    return account ? structuredClone(account) : null;
+  }
+
+  async syncChatGptWebAccounts(configs: ChatGptWebAccountConfig[]): Promise<void> {
+    const now = new Date();
+    for (const config of configs) {
+      const current = this.chatGptWebAccounts.get(config.accountId);
+      const next = current
+        ? { ...current, bridgeUrl: config.bridgeUrl, vncPath: config.vncPath }
+        : defaultChatGptWebAccount(config, now);
+      const parsed = ChatGptWebAccountSchema.parse(next);
+      this.chatGptWebAccounts.set(config.accountId, {
+        ...parsed,
+        bridgeUrl: config.bridgeUrl,
+      });
+    }
+    const configured = await this.listChatGptWebAccounts();
+    if (configured.length && configured.every((account) => account.routingWeight === 0)) {
+      await this.updateChatGptWebRoutingWeights(
+        equalChatGptWebRoutingWeights(configured.map((account) => account.accountId)),
+      );
+    }
+  }
+
+  async updateChatGptWebAccount(
+    accountId: string,
+    patch: ChatGptWebAccountPatch,
+  ): Promise<ChatGptWebAccountRecord> {
+    const current = this.chatGptWebAccounts.get(accountId);
+    if (!current) throw new Error("chatgpt_web_account_not_found");
+    const updated = ChatGptWebAccountSchema.parse({
+      ...current,
+      ...structuredClone(patch),
+      accountId: current.accountId,
+      slot: current.slot,
+      vncPath: current.vncPath,
+      updatedAt: new Date().toISOString(),
+    });
+    const record = { ...updated, bridgeUrl: current.bridgeUrl };
+    this.chatGptWebAccounts.set(accountId, record);
+    return structuredClone(record);
+  }
+
+  async updateChatGptWebRoutingWeights(
+    weights: Record<string, number>,
+  ): Promise<ChatGptWebAccountRecord[]> {
+    const accounts = await this.listChatGptWebAccounts();
+    assertRoutingWeights(accounts, weights);
+    const now = new Date().toISOString();
+    for (const account of accounts) {
+      const updated = ChatGptWebAccountSchema.parse({
+        ...account,
+        routingWeight: weights[account.accountId],
+        updatedAt: now,
+      });
+      this.chatGptWebAccounts.set(account.accountId, {
+        ...updated,
+        bridgeUrl: account.bridgeUrl,
+      });
+    }
+    return this.listChatGptWebAccounts();
+  }
+
+  async acquireChatGptWebAccountLease(
+    jobId: string,
+    accountIds: string[],
+    now: Date,
+    leaseMs: number,
+  ): Promise<ChatGptWebAccountRecord | null> {
+    return this.withChatGptWebAccountLeaseLock(async () => {
+      for (const account of await this.listChatGptWebAccounts()) {
+        if (
+          accountIds.includes(account.accountId) &&
+          account.activeJobId &&
+          account.leaseExpiresAt &&
+          new Date(account.leaseExpiresAt).getTime() <= now.getTime()
+        ) {
+          const isolated = ChatGptWebAccountSchema.parse({
+            ...account,
+            qualified: false,
+            state: "quarantined",
+            activeJobId: null,
+            leaseExpiresAt: null,
+            lastFailureAt: now.toISOString(),
+            lastFailureCode: "chatgpt_lease_expired",
+            updatedAt: now.toISOString(),
+          });
+          this.chatGptWebAccounts.set(account.accountId, {
+            ...isolated,
+            bridgeUrl: account.bridgeUrl,
+          });
+        }
+      }
+      const candidates = (await this.listChatGptWebAccounts()).filter(
+        (account) =>
+          accountIds.includes(account.accountId) &&
+          account.enabled &&
+          account.qualified &&
+          account.state === "ready" &&
+          account.activeJobId === null &&
+          account.rateLimitState !== "cooldown" &&
+          account.rateLimitState !== "recovery_probe" &&
+          (!account.lastSubmissionAt ||
+            new Date(account.lastSubmissionAt).getTime() <= now.getTime() - 90_000),
+      );
+      const selected = selectWeightedChatGptWebAccount(jobId, candidates);
+      if (!selected) return null;
+      const leased = ChatGptWebAccountSchema.parse({
+        ...selected,
+        state: "busy",
+        activeJobId: jobId,
+        leaseExpiresAt: new Date(now.getTime() + leaseMs).toISOString(),
+        leaseEpoch: selected.leaseEpoch + 1,
+        stateVersion: selected.stateVersion + 1,
+        updatedAt: now.toISOString(),
+      });
+      const record = { ...leased, bridgeUrl: selected.bridgeUrl };
+      this.chatGptWebAccounts.set(selected.accountId, record);
+      return structuredClone(record);
+    });
+  }
+
+  async releaseChatGptWebAccountLease(
+    accountId: string,
+    jobId: string,
+    leaseEpoch: number,
+    patch: ChatGptWebAccountPatch = {},
+  ): Promise<ChatGptWebAccountRecord | null> {
+    return this.withChatGptWebAccountLeaseLock(async () => {
+      const current = this.chatGptWebAccounts.get(accountId);
+      if (!current || current.activeJobId !== jobId || current.leaseEpoch !== leaseEpoch)
+        return null;
+      const updated = ChatGptWebAccountSchema.parse({
+        ...current,
+        ...structuredClone(patch),
+        activeJobId: null,
+        leaseExpiresAt: null,
+        stateVersion: current.stateVersion + 1,
+        accountId: current.accountId,
+        slot: current.slot,
+        vncPath: current.vncPath,
+        updatedAt: new Date().toISOString(),
+      });
+      const record = { ...updated, bridgeUrl: current.bridgeUrl };
+      this.chatGptWebAccounts.set(accountId, record);
+      return structuredClone(record);
+    });
+  }
+
+  async renewChatGptWebAccountLease(
+    accountId: string,
+    jobId: string,
+    leaseEpoch: number,
+    now: Date,
+    leaseMs: number,
+  ): Promise<boolean> {
+    return this.withChatGptWebAccountLeaseLock(async () => {
+      const current = this.chatGptWebAccounts.get(accountId);
+      if (
+        !current ||
+        current.activeJobId !== jobId ||
+        current.leaseEpoch !== leaseEpoch ||
+        !current.leaseExpiresAt ||
+        new Date(current.leaseExpiresAt).getTime() <= now.getTime()
+      ) {
+        return false;
+      }
+      const updated = ChatGptWebAccountSchema.parse({
+        ...current,
+        leaseExpiresAt: new Date(now.getTime() + leaseMs).toISOString(),
+        updatedAt: now.toISOString(),
+      });
+      this.chatGptWebAccounts.set(accountId, { ...updated, bridgeUrl: current.bridgeUrl });
+      return true;
+    });
+  }
+
+  async createChatGptWebSubmitIntent(
+    intent: ChatGptWebSubmitIntent,
+  ): Promise<ChatGptWebSubmitIntent> {
+    const account = this.chatGptWebAccounts.get(intent.accountId);
+    if (
+      !account ||
+      account.activeJobId !== intent.jobId ||
+      account.leaseEpoch !== intent.leaseEpoch ||
+      !account.leaseExpiresAt ||
+      new Date(account.leaseExpiresAt).getTime() <= Date.now()
+    ) {
+      throw new Error("chatgpt_lease_lost");
+    }
+    const existing = [...this.chatGptWebSubmitIntents.values()].find(
+      (candidate) => candidate.jobId === intent.jobId,
+    );
+    if (existing) {
+      if (existing.state !== "prepared") throw new Error("chatgpt_submission_already_started");
+      const priorAccount = this.chatGptWebAccounts.get(existing.accountId);
+      const priorLeaseStillActive =
+        priorAccount?.activeJobId === existing.jobId &&
+        priorAccount.leaseEpoch === existing.leaseEpoch &&
+        Boolean(priorAccount.leaseExpiresAt) &&
+        new Date(priorAccount.leaseExpiresAt!).getTime() > Date.now();
+      if (priorLeaseStillActive) throw new Error("chatgpt_submission_already_started");
+      this.chatGptWebSubmitIntents.delete(existing.intentId);
+    }
+    this.chatGptWebSubmitIntents.set(intent.intentId, structuredClone(intent));
+    return structuredClone(intent);
+  }
+
+  async advanceChatGptWebSubmitIntent(
+    intentId: string,
+    leaseEpoch: number,
+    state: ChatGptWebSubmitIntentState,
+    phaseSequence: number,
+  ): Promise<boolean> {
+    const current = this.chatGptWebSubmitIntents.get(intentId);
+    const account = current ? this.chatGptWebAccounts.get(current.accountId) : null;
+    if (
+      !current ||
+      !account ||
+      current.leaseEpoch !== leaseEpoch ||
+      account.activeJobId !== current.jobId ||
+      account.leaseEpoch !== leaseEpoch ||
+      !account.leaseExpiresAt ||
+      new Date(account.leaseExpiresAt).getTime() <= Date.now() ||
+      phaseSequence <= current.phaseSequence ||
+      current.state === "completed" ||
+      current.state === "failed"
+    ) {
+      return false;
+    }
+    this.chatGptWebSubmitIntents.set(intentId, {
+      ...current,
+      state,
+      phaseSequence,
+      updatedAt: new Date().toISOString(),
+    });
+    return true;
+  }
+
+  private async withChatGptWebAccountLeaseLock<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.chatGptWebAccountLeaseTail;
+    let unlock!: () => void;
+    const current = new Promise<void>((resolve) => {
+      unlock = resolve;
+    });
+    this.chatGptWebAccountLeaseTail = previous.then(() => current);
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      unlock();
+    }
+  }
+
+  async createChatGptWebQualificationRun(
+    run: ChatGptWebQualificationRun,
+  ): Promise<ChatGptWebQualificationRun> {
+    const parsed = ChatGptWebQualificationRunSchema.parse(structuredClone(run));
+    this.chatGptWebQualificationRuns.set(parsed.id, parsed);
+    return structuredClone(parsed);
+  }
+
+  async findChatGptWebQualificationRun(id: string): Promise<ChatGptWebQualificationRun | null> {
+    const run = this.chatGptWebQualificationRuns.get(id);
+    return run ? structuredClone(run) : null;
+  }
+
+  async updateChatGptWebQualificationRun(
+    id: string,
+    patch: Partial<ChatGptWebQualificationRun>,
+  ): Promise<ChatGptWebQualificationRun> {
+    const current = this.chatGptWebQualificationRuns.get(id);
+    if (!current) throw new Error("chatgpt_web_qualification_not_found");
+    const updated = ChatGptWebQualificationRunSchema.parse({
+      ...current,
+      ...structuredClone(patch),
+      id,
+      updatedAt: new Date().toISOString(),
+    });
+    this.chatGptWebQualificationRuns.set(id, updated);
+    return structuredClone(updated);
+  }
+
+  async listChatGptWebQualificationRuns(limit = 20): Promise<ChatGptWebQualificationRun[]> {
+    return [...this.chatGptWebQualificationRuns.values()]
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+      .slice(0, Math.min(limit, 100))
+      .map((run) => structuredClone(run));
+  }
+
+  async listModelSettings(): Promise<ModelSetting[]> {
+    return [...this.modelSettings.values()].map((setting) => structuredClone(setting));
+  }
+
+  async setModelEnabled(modelId: string, enabled: boolean, actorId: string): Promise<ModelSetting> {
+    const stored = { modelId, enabled, updatedBy: actorId, updatedAt: new Date().toISOString() };
+    this.modelSettings.set(modelId, stored);
+    return structuredClone(stored);
+  }
+
+  async setModelEnabledIdempotent(
+    modelId: string,
+    enabled: boolean,
+    actorId: string,
+    idempotencyKey: string,
+    requestHash: string,
+  ): Promise<ModelSettingResult> {
+    const key = `${actorId}:${idempotencyKey}`;
+    const existing = this.modelSettingRequests.get(key);
+    if (existing) {
+      if (existing.requestHash !== requestHash) throw new Error("idempotency_conflict");
+      return { setting: structuredClone(existing.setting), replayed: true };
+    }
+    const setting = await this.setModelEnabled(modelId, enabled, actorId);
+    this.modelSettingRequests.set(key, { requestHash, setting: structuredClone(setting) });
+    return { setting, replayed: false };
+  }
+
+  async upsertSessionThread(thread: SessionThread): Promise<SessionThread> {
+    this.sessionThreads.set(thread.sessionKey, structuredClone(thread));
+    return structuredClone(thread);
+  }
+
+  async findSessionThread(sessionKey: string): Promise<SessionThread | null> {
+    const thread = this.sessionThreads.get(sessionKey);
+    return thread ? structuredClone(thread) : null;
+  }
+
+  async listSessionThreads(
+    actorId: string,
+    isAdmin: boolean,
+    limit = 100,
+  ): Promise<SessionThread[]> {
+    return [...this.sessionThreads.values()]
+      .filter((thread) => isAdmin || thread.callerId === actorId)
+      .sort((left, right) => right.lastUsedAt.localeCompare(left.lastUsedAt))
+      .slice(0, limit)
+      .map((thread) => structuredClone(thread));
+  }
+
+  async deleteExpiredSessionThreads(now: Date): Promise<number> {
+    let deleted = 0;
+    for (const [sessionKey, thread] of this.sessionThreads.entries()) {
+      if (new Date(thread.expiresAt) <= now) {
+        this.sessionThreads.delete(sessionKey);
+        deleted += 1;
+      }
+    }
+    return deleted;
+  }
+
+  async createApiKey(record: StoredApiKey): Promise<StoredApiKey> {
+    this.apiKeys.set(record.id, structuredClone(record));
+    return structuredClone(record);
+  }
+
+  async createApiKeyIdempotent(
+    actorId: string,
+    idempotencyKey: string,
+    requestHashValue: string,
+    record: StoredApiKey,
+    plaintext: string,
+  ): Promise<ApiKeyCreationResult> {
+    const requestKey = `${actorId}:${idempotencyKey}`;
+    const existing = this.apiKeyRequests.get(requestKey);
+    if (existing) {
+      if (existing.requestHash !== requestHashValue) throw new Error("idempotency_conflict");
+      return {
+        record: structuredClone(existing.record),
+        plaintext: existing.plaintext,
+        replayed: true,
+      };
+    }
+    this.apiKeys.set(record.id, structuredClone(record));
+    this.apiKeyRequests.set(requestKey, {
+      requestHash: requestHashValue,
+      record: structuredClone(record),
+      plaintext,
+    });
+    return { record: structuredClone(record), plaintext, replayed: false };
+  }
+
+  async findApiKeyByPrefix(prefix: string): Promise<StoredApiKey | null> {
+    const record = [...this.apiKeys.values()].find((candidate) => candidate.prefix === prefix);
+    return record ? structuredClone(record) : null;
+  }
+
+  async findApiKeyById(id: string): Promise<StoredApiKey | null> {
+    const record = this.apiKeys.get(id);
+    return record ? structuredClone(record) : null;
+  }
+
+  async listApiKeys(): Promise<ApiKeyMetadata[]> {
+    return [...this.apiKeys.values()].map((record) => structuredClone(apiKeyWithoutDigest(record)));
+  }
+
+  async listApiKeysForActor(actorId: string, isAdmin: boolean): Promise<ApiKeyMetadata[]> {
+    return [...this.apiKeys.values()]
+      .filter((record) => isAdmin || record.createdBy === actorId)
+      .map((record) => structuredClone(apiKeyWithoutDigest(record)));
+  }
+
+  async touchApiKey(id: string): Promise<void> {
+    const record = this.apiKeys.get(id);
+    if (record) {
+      this.apiKeys.set(id, { ...record, lastUsedAt: new Date().toISOString() });
+    }
+  }
+
+  async revokeApiKey(id: string): Promise<void> {
+    const record = this.apiKeys.get(id);
+    if (record) {
+      this.apiKeys.set(id, { ...record, revokedAt: new Date().toISOString() });
+    }
+  }
+
+  async apiKeyCount(): Promise<number> {
+    return this.apiKeys.size;
+  }
+
+  async activeAdminApiKeyCount(): Promise<number> {
+    return [...this.apiKeys.values()].filter(
+      (record) => record.scopes.includes("admin") && !record.revokedAt,
+    ).length;
+  }
+
+  async consumeRateLimit(subject: string, limit: number, now: Date): Promise<boolean> {
+    const minute = Math.floor(now.getTime() / 60_000);
+    const current = this.rateLimits.get(subject);
+    const count = current?.minute === minute ? current.count + 1 : 1;
+    this.rateLimits.set(subject, { minute, count });
+    return count <= limit;
+  }
+
+  async createUser(user: IdentityUser): Promise<IdentityUser> {
+    this.users.set(user.id, structuredClone(user));
+    return structuredClone(user);
+  }
+
+  async findUserByEmail(email: string): Promise<IdentityUser | null> {
+    const user = [...this.users.values()].find((candidate) => candidate.email === email);
+    return user ? structuredClone(user) : null;
+  }
+
+  async findUserById(id: string): Promise<IdentityUser | null> {
+    const user = this.users.get(id);
+    return user ? structuredClone(user) : null;
+  }
+
+  async userCount(): Promise<number> {
+    return this.users.size;
+  }
+
+  async createPasskey(passkey: StoredPasskey): Promise<void> {
+    this.passkeys.set(passkey.id, structuredClone(passkey));
+  }
+
+  async passkeysForUser(userId: string): Promise<StoredPasskey[]> {
+    return [...this.passkeys.values()]
+      .filter((passkey) => passkey.userId === userId)
+      .map((passkey) => structuredClone(passkey));
+  }
+
+  async findPasskey(credentialId: string): Promise<StoredPasskey | null> {
+    const passkey = [...this.passkeys.values()].find(
+      (candidate) => candidate.credentialId === credentialId,
+    );
+    return passkey ? structuredClone(passkey) : null;
+  }
+
+  async updatePasskeyCounter(id: string, counter: number): Promise<void> {
+    const passkey = this.passkeys.get(id);
+    if (passkey) {
+      this.passkeys.set(id, { ...passkey, counter });
+    }
+  }
+
+  async createChallenge(challenge: AuthChallenge): Promise<void> {
+    this.challenges.set(challenge.id, structuredClone(challenge));
+  }
+
+  async consumeChallenge(id: string): Promise<AuthChallenge | null> {
+    const challenge = this.challenges.get(id);
+    if (!challenge || challenge.usedAt || new Date(challenge.expiresAt) <= new Date()) {
+      return null;
+    }
+    this.challenges.set(id, { ...challenge, usedAt: new Date().toISOString() });
+    return structuredClone(challenge);
+  }
+
+  async createSession(session: AuthSession): Promise<void> {
+    this.sessions.set(session.id, structuredClone(session));
+  }
+
+  async findSessionByDigest(digest: string): Promise<AuthSession | null> {
+    const session = [...this.sessions.values()].find(
+      (candidate) => candidate.digest === digest && new Date(candidate.expiresAt) > new Date(),
+    );
+    return session ? structuredClone(session) : null;
+  }
+
+  async deleteSessionByDigest(digest: string): Promise<boolean> {
+    const session = [...this.sessions.values()].find((candidate) => candidate.digest === digest);
+    if (!session) return false;
+    return this.sessions.delete(session.id);
+  }
+
+  async createRecoveryCodes(records: RecoveryCodeRecord[]): Promise<void> {
+    for (const record of records) {
+      this.recoveryCodes.set(record.id, structuredClone(record));
+    }
+  }
+
+  async consumeRecoveryCode(userId: string, digest: string): Promise<boolean> {
+    const record = [...this.recoveryCodes.values()].find(
+      (candidate) =>
+        candidate.userId === userId && candidate.digest === digest && !candidate.usedAt,
+    );
+    if (!record) {
+      return false;
+    }
+    this.recoveryCodes.set(record.id, { ...record, usedAt: new Date().toISOString() });
+    return true;
+  }
+
+  async appendAudit(event: AuditEvent): Promise<void> {
+    this.auditEvents.push(structuredClone(event));
+  }
+
+  async listAudit(limit = 100): Promise<AuditEvent[]> {
+    return this.auditEvents
+      .slice()
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+      .slice(0, Math.min(limit, 500))
+      .map((event) => structuredClone(event));
+  }
+
+  async listDeletionReceipts(limit = 100): Promise<DeletionReceipt[]> {
+    return [...this.deletionReceipts.values()]
+      .sort((left, right) => right.payloadDeletedAt.localeCompare(left.payloadDeletedAt))
+      .slice(0, Math.min(limit, 500))
+      .map((receipt) => structuredClone(receipt));
+  }
+
+  async deleteExpiredPayloads(now: Date): Promise<number> {
+    let deleted = 0;
+    for (const [id, job] of this.jobs.entries()) {
+      if (new Date(job.expiresAt) <= now && job.task.objective !== "[deleted]") {
+        this.jobs.set(id, {
+          ...job,
+          task: { ...job.task, objective: "[deleted]", requiredContext: [], constraints: [] },
+          output: null,
+        });
+        this.eventMap.delete(id);
+        this.deletionReceipts.set(id, {
+          id: randomUUID(),
+          jobId: id,
+          payloadDeletedAt: now.toISOString(),
+          metadataDeleteAfter: new Date(
+            new Date(job.createdAt).getTime() + 90 * 86_400_000,
+          ).toISOString(),
+        });
+        deleted += 1;
+      }
+    }
+    return deleted;
+  }
+
+  async deleteExpiredMetadata(now: Date): Promise<number> {
+    const cutoff = new Date(now.getTime() - 90 * 86_400_000);
+    let deleted = 0;
+    for (const [id, job] of this.jobs.entries()) {
+      if (new Date(job.createdAt) <= cutoff) {
+        this.jobs.delete(id);
+        this.eventMap.delete(id);
+        deleted += 1;
+      }
+    }
+    return deleted;
+  }
+}
+
+export const DATABASE_MIGRATION_SQL = `
+CREATE TABLE IF NOT EXISTS jobs (
+  id UUID PRIMARY KEY,
+  status TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  idempotency_key TEXT,
+  caller_id TEXT NOT NULL,
+  task JSONB NOT NULL,
+  route JSONB,
+  output JSONB,
+  error_code TEXT,
+  error_message TEXT,
+  usage JSONB NOT NULL,
+  validation JSONB,
+  next_event_sequence INTEGER NOT NULL DEFAULT 0,
+  state_version BIGINT NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  UNIQUE (caller_id, idempotency_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_jobs_status_created_at ON jobs(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_jobs_expires_at ON jobs(expires_at);
+
+CREATE TABLE IF NOT EXISTS job_events (
+  id UUID PRIMARY KEY,
+  job_id UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+  sequence INTEGER NOT NULL,
+  type TEXT NOT NULL,
+  data JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  UNIQUE (job_id, sequence)
+);
+
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS next_event_sequence INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS state_version BIGINT NOT NULL DEFAULT 0;
+UPDATE jobs AS j
+SET next_event_sequence = recovered.next_sequence
+FROM (
+  SELECT j2.id, COALESCE(MAX(e.sequence), -1) + 1 AS next_sequence
+  FROM jobs AS j2
+  LEFT JOIN job_events AS e ON e.job_id = j2.id
+  GROUP BY j2.id
+) AS recovered
+WHERE j.id = recovered.id AND j.next_event_sequence < recovered.next_sequence;
+
+CREATE TABLE IF NOT EXISTS api_keys (
+  id UUID PRIMARY KEY,
+  created_by TEXT NOT NULL DEFAULT 'legacy',
+  name TEXT NOT NULL,
+  prefix TEXT UNIQUE NOT NULL,
+  digest TEXT NOT NULL,
+  scopes TEXT[] NOT NULL,
+  execution_channels TEXT[] NOT NULL DEFAULT ARRAY['codex']::TEXT[],
+  execution_default_preset TEXT NOT NULL DEFAULT 'restricted',
+  execution_allowed_presets TEXT[] NOT NULL DEFAULT ARRAY['restricted']::TEXT[],
+  rate_limit_per_minute INTEGER NOT NULL,
+  expires_at TIMESTAMPTZ,
+  revoked_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL,
+  last_used_at TIMESTAMPTZ
+);
+
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS created_by TEXT NOT NULL DEFAULT 'legacy';
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS execution_channels TEXT[];
+UPDATE api_keys
+SET execution_channels = CASE
+  WHEN 'admin' = ANY(scopes) OR 'chatgpt:web' = ANY(scopes)
+    THEN ARRAY['codex', 'chatgpt_web']::TEXT[]
+  ELSE ARRAY['codex']::TEXT[]
+END
+WHERE execution_channels IS NULL;
+ALTER TABLE api_keys ALTER COLUMN execution_channels SET DEFAULT ARRAY['codex']::TEXT[];
+ALTER TABLE api_keys ALTER COLUMN execution_channels SET NOT NULL;
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS execution_default_preset TEXT NOT NULL DEFAULT 'restricted';
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS execution_allowed_presets TEXT[] NOT NULL DEFAULT ARRAY['restricted']::TEXT[];
+
+CREATE TABLE IF NOT EXISTS api_key_requests (
+  actor_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  api_key_id UUID NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
+  response JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (actor_id, idempotency_key)
+);
+
+CREATE TABLE IF NOT EXISTS rate_limit_windows (
+  subject TEXT NOT NULL,
+  window_start TIMESTAMPTZ NOT NULL,
+  request_count INTEGER NOT NULL,
+  PRIMARY KEY (subject, window_start)
+);
+
+CREATE TABLE IF NOT EXISTS quota_snapshots (
+  id UUID PRIMARY KEY,
+  provider TEXT NOT NULL,
+  snapshot JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS quota_current (
+  provider TEXT PRIMARY KEY,
+  snapshot JSONB NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS model_catalog_current (
+  provider TEXT PRIMARY KEY,
+  snapshot JSONB NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS chatgpt_web_status (
+  singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+  status JSONB NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS chatgpt_web_accounts (
+  account_id TEXT PRIMARY KEY CHECK (account_id ~ '^account-[a-d]$'),
+  slot TEXT UNIQUE NOT NULL CHECK (slot IN ('a', 'b', 'c', 'd')),
+  label TEXT NOT NULL,
+  plan TEXT NOT NULL CHECK (plan IN ('plus', 'pro', 'unknown')),
+  bridge_url TEXT NOT NULL,
+  vnc_path TEXT NOT NULL,
+  enabled BOOLEAN NOT NULL DEFAULT FALSE,
+  qualified BOOLEAN NOT NULL DEFAULT FALSE,
+  status JSONB NOT NULL,
+  lease_job_id UUID,
+  lease_expires_at TIMESTAMPTZ,
+  lease_epoch BIGINT NOT NULL DEFAULT 0,
+  state_version BIGINT NOT NULL DEFAULT 0,
+  updated_at TIMESTAMPTZ NOT NULL
+);
+
+ALTER TABLE chatgpt_web_accounts ADD COLUMN IF NOT EXISTS lease_epoch BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE chatgpt_web_accounts ADD COLUMN IF NOT EXISTS state_version BIGINT NOT NULL DEFAULT 0;
+
+CREATE INDEX IF NOT EXISTS idx_chatgpt_web_accounts_eligible
+  ON chatgpt_web_accounts(enabled, qualified, slot);
+CREATE INDEX IF NOT EXISTS idx_chatgpt_web_accounts_lease
+  ON chatgpt_web_accounts(lease_expires_at);
+
+CREATE TABLE IF NOT EXISTS chatgpt_web_submit_intents (
+  intent_id UUID PRIMARY KEY,
+  job_id UUID NOT NULL UNIQUE REFERENCES jobs(id) ON DELETE CASCADE,
+  account_id TEXT NOT NULL REFERENCES chatgpt_web_accounts(account_id),
+  lease_epoch BIGINT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN (
+    'prepared','command_accepted','action_started','echo_verified','completed','failed'
+  )),
+  phase_sequence INTEGER NOT NULL DEFAULT 0,
+  deadline_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_chatgpt_web_submit_intents_state
+  ON chatgpt_web_submit_intents(state, updated_at);
+
+CREATE TABLE IF NOT EXISTS chatgpt_web_qualification_runs (
+  id UUID PRIMARY KEY,
+  run JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_chatgpt_web_qualification_runs_created_at
+  ON chatgpt_web_qualification_runs(created_at DESC);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_chatgpt_web_qualification_runs_one_active
+  ON chatgpt_web_qualification_runs ((1))
+  WHERE run->>'status' IN ('accepted', 'running');
+
+CREATE TABLE IF NOT EXISTS model_settings (
+  model_id TEXT PRIMARY KEY,
+  enabled BOOLEAN NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL,
+  updated_by TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS model_setting_requests (
+  actor_id TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  response JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (actor_id, idempotency_key)
+);
+
+INSERT INTO model_settings (model_id, enabled, updated_at, updated_by) VALUES
+  ('gpt-5.6-luna', TRUE, NOW(), 'migration'),
+  ('gpt-5.6-terra', TRUE, NOW(), 'migration'),
+  ('gpt-5.6-sol', TRUE, NOW(), 'migration')
+ON CONFLICT (model_id) DO NOTHING;
+
+-- session_threads stores only conversation governance metadata (no payload content),
+-- so it stays plaintext like model_settings.
+CREATE TABLE IF NOT EXISTS session_threads (
+  session_key TEXT PRIMARY KEY,
+  caller_id TEXT NOT NULL,
+  model TEXT NOT NULL,
+  effort TEXT NOT NULL,
+  turn_count INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL,
+  last_used_at TIMESTAMPTZ NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS session_threads_caller_idx ON session_threads (caller_id, last_used_at DESC);
+CREATE INDEX IF NOT EXISTS session_threads_expiry_idx ON session_threads (expires_at);
+
+CREATE TABLE IF NOT EXISTS audit_events (
+  id UUID PRIMARY KEY,
+  actor_id TEXT NOT NULL,
+  action TEXT NOT NULL,
+  resource_type TEXT NOT NULL,
+  resource_id TEXT,
+  metadata JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_events_created_at ON audit_events(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS deletion_receipts (
+  id UUID PRIMARY KEY,
+  job_id UUID UNIQUE NOT NULL,
+  payload_deleted_at TIMESTAMPTZ NOT NULL,
+  metadata_delete_after TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS identity_users (
+  id UUID PRIMARY KEY,
+  email TEXT UNIQUE NOT NULL,
+  display_name TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS passkeys (
+  id UUID PRIMARY KEY,
+  user_id UUID NOT NULL REFERENCES identity_users(id) ON DELETE CASCADE,
+  credential_id TEXT UNIQUE NOT NULL,
+  public_key_base64 TEXT NOT NULL,
+  counter BIGINT NOT NULL,
+  transports TEXT[] NOT NULL,
+  device_type TEXT NOT NULL,
+  backed_up BOOLEAN NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS auth_challenges (
+  id UUID PRIMARY KEY,
+  user_id UUID NOT NULL REFERENCES identity_users(id) ON DELETE CASCADE,
+  purpose TEXT NOT NULL,
+  challenge TEXT NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  used_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS auth_sessions (
+  id UUID PRIMARY KEY,
+  user_id UUID NOT NULL REFERENCES identity_users(id) ON DELETE CASCADE,
+  digest TEXT UNIQUE NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS recovery_codes (
+  id UUID PRIMARY KEY,
+  user_id UUID NOT NULL REFERENCES identity_users(id) ON DELETE CASCADE,
+  digest TEXT UNIQUE NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  used_at TIMESTAMPTZ
+);
+`;
+
+export class PostgresJobRepository implements JobRepository {
+  readonly pool: pg.Pool;
+
+  constructor(
+    connectionString: string,
+    private readonly masterKeyBase64: string,
+  ) {
+    if (Buffer.from(masterKeyBase64, "base64").length !== 32) {
+      throw new Error("payload_master_key_must_be_32_bytes");
+    }
+    this.pool = new Pool({ connectionString, max: 10 });
+  }
+
+  private encrypt(value: unknown, aad: string): unknown {
+    return encryptRecord(value, this.masterKeyBase64, aad);
+  }
+
+  private decrypt<T>(value: unknown, aad: string): T {
+    if (!isEncryptedRecord(value)) {
+      throw new Error("unencrypted_database_payload_rejected");
+    }
+    return decryptRecord<T>(value, this.masterKeyBase64, aad);
+  }
+
+  private rowToJob(row: Record<string, any>): Job {
+    return {
+      id: row.id,
+      status: row.status as JobStatus,
+      requestHash: row.request_hash,
+      idempotencyKey: row.idempotency_key,
+      callerId: row.caller_id,
+      task: this.decrypt(row.task, `job:${row.id}:task:v2`),
+      route: row.route,
+      output: row.output === null ? null : this.decrypt(row.output, `job:${row.id}:output:v2`),
+      errorCode: row.error_code,
+      errorMessage: row.error_message,
+      usage: UsageLedgerSchema.parse(row.usage),
+      validation: row.validation,
+      createdAt: new Date(row.created_at).toISOString(),
+      updatedAt: new Date(row.updated_at).toISOString(),
+      expiresAt: new Date(row.expires_at).toISOString(),
+    };
+  }
+
+  private transactionalSql(client: pg.PoolClient): TransactionalSql {
+    return {
+      executeSql: async (text, values = []) => {
+        const result = await client.query(text, values);
+        return { rows: result.rows };
+      },
+    };
+  }
+
+  private async insertAudit(client: pg.PoolClient, audit: AuditEvent): Promise<void> {
+    await client.query(
+      `INSERT INTO audit_events (
+        id,actor_id,action,resource_type,resource_id,metadata,created_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [
+        audit.id,
+        audit.actorId,
+        audit.action,
+        audit.resourceType,
+        audit.resourceId,
+        audit.metadata,
+        audit.createdAt,
+      ],
+    );
+  }
+
+  private async insertJobEvent(
+    client: pg.PoolClient,
+    jobId: string,
+    type: JobEvent["type"],
+    data: Record<string, unknown>,
+    createdAt = new Date().toISOString(),
+  ): Promise<JobEvent> {
+    const sequenceResult = await client.query(
+      `UPDATE jobs
+       SET next_event_sequence=next_event_sequence+1
+       WHERE id=$1
+       RETURNING next_event_sequence-1 AS sequence`,
+      [jobId],
+    );
+    if (!sequenceResult.rowCount) throw new Error("job_not_found");
+    const event: JobEvent = {
+      id: randomUUID(),
+      jobId,
+      sequence: Number(sequenceResult.rows[0].sequence),
+      type,
+      data,
+      createdAt,
+    };
+    await client.query(
+      `INSERT INTO job_events (id,job_id,sequence,type,data,created_at)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [
+        event.id,
+        event.jobId,
+        event.sequence,
+        event.type,
+        this.encrypt(event.data, `job:${event.jobId}:event:${event.sequence}:v2`),
+        event.createdAt,
+      ],
+    );
+    return event;
+  }
+
+  async migrate(): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SELECT pg_advisory_xact_lock(hashtext('routeloom_migrate'))");
+      await client.query(DATABASE_MIGRATION_SQL);
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+          version INTEGER PRIMARY KEY,
+          applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `);
+      await client.query(
+        "INSERT INTO schema_migrations (version) VALUES (1) ON CONFLICT (version) DO NOTHING",
+      );
+      const permissionPolicyMigration = await client.query(
+        "SELECT 1 FROM schema_migrations WHERE version=2",
+      );
+      if (!permissionPolicyMigration.rowCount) {
+        await client.query(
+          `UPDATE api_keys
+           SET execution_default_preset='full',
+               execution_allowed_presets=ARRAY['restricted','confirm','full']::TEXT[]
+           WHERE 'admin'=ANY(scopes)`,
+        );
+        await client.query("INSERT INTO schema_migrations (version) VALUES (2)");
+      }
+      const statusMigration = await client.query("SELECT 1 FROM schema_migrations WHERE version=3");
+      if (!statusMigration.rowCount) {
+        const legacyRows = await client.query("SELECT * FROM jobs WHERE status='needs_review'");
+        for (const row of legacyRows.rows) {
+          let classified: ReturnType<typeof classifyLegacyReview>;
+          try {
+            classified = classifyLegacyReview(
+              this.decrypt(row.task, `job:${row.id}:task:v2`),
+              row.output === null ? null : this.decrypt(row.output, `job:${row.id}:output:v2`),
+              row.validation,
+              row.error_code,
+            );
+          } catch {
+            classified = {
+              status: "failed",
+              validation: row.validation,
+              errorCode: "legacy_migration_failed",
+              errorMessage: "The historical review record could not be revalidated.",
+            };
+          }
+          await client.query(
+            `UPDATE jobs SET status=$2, validation=$3, error_code=$4, error_message=$5,
+             updated_at=NOW() WHERE id=$1`,
+            [
+              row.id,
+              classified.status,
+              classified.validation,
+              classified.errorCode,
+              classified.errorMessage,
+            ],
+          );
+          const sequenceResult = await client.query(
+            "SELECT COALESCE(MAX(sequence), -1) + 1 AS sequence FROM job_events WHERE job_id=$1",
+            [row.id],
+          );
+          const sequence = Number(sequenceResult.rows[0].sequence);
+          await client.query(
+            `INSERT INTO job_events (id,job_id,sequence,type,data,created_at)
+             VALUES ($1,$2,$3,'status',$4,NOW())`,
+            [
+              randomUUID(),
+              row.id,
+              sequence,
+              this.encrypt(
+                { status: classified.status, migratedFrom: "needs_review" },
+                `job:${row.id}:event:${sequence}:v2`,
+              ),
+            ],
+          );
+          await client.query(
+            `INSERT INTO audit_events
+             (id,actor_id,action,resource_type,resource_id,metadata,created_at)
+             VALUES ($1,'migration','job.status_reclassified','job',$2,$3,NOW())`,
+            [randomUUID(), row.id, { from: "needs_review", to: classified.status }],
+          );
+        }
+        await client.query("INSERT INTO schema_migrations (version) VALUES (3)");
+      }
+      const historicalEventMigration = await client.query(
+        "SELECT 1 FROM schema_migrations WHERE version=4",
+      );
+      if (!historicalEventMigration.rowCount) {
+        const candidateRows = await client.query(`
+          SELECT j.id, j.status, j.updated_at
+          FROM jobs AS j
+          WHERE NOT EXISTS (
+            SELECT 1 FROM job_events AS e WHERE e.job_id = j.id
+          )
+          ORDER BY j.created_at ASC, j.id ASC
+          FOR UPDATE OF j
+        `);
+        const jobIds = candidateRows.rows.map((row) => String(row.id));
+        const auditRows = jobIds.length
+          ? await client.query(
+              `SELECT resource_id, action, created_at
+               FROM audit_events
+               WHERE resource_type='job' AND resource_id = ANY($1::text[])
+               ORDER BY created_at ASC, id ASC`,
+              [jobIds],
+            )
+          : { rows: [] };
+        const auditsByJob = new Map<string, HistoricalAuditStatusRecord[]>();
+        for (const row of auditRows.rows) {
+          const jobId = String(row.resource_id);
+          const audits = auditsByJob.get(jobId) ?? [];
+          audits.push({
+            action: String(row.action),
+            createdAt: new Date(row.created_at).toISOString(),
+          });
+          auditsByJob.set(jobId, audits);
+        }
+        const report: HistoricalJobEventRecoveryReport = {
+          version: 4,
+          candidateJobs: candidateRows.rows.length,
+          insertedEvents: 0,
+          auditDerivedEvents: 0,
+          currentStatusEvents: 0,
+          jobsWithUnresolvedHistory: 0,
+          ignoredAuditActions: 0,
+        };
+        for (const row of candidateRows.rows) {
+          const currentStatus = JobStatusSchema.parse(row.status);
+          const reconstructed = reconstructHistoricalJobEventData(
+            currentStatus,
+            new Date(row.updated_at).toISOString(),
+            auditsByJob.get(String(row.id)) ?? [],
+          );
+          if (reconstructed.hasUnresolvedHistory) report.jobsWithUnresolvedHistory += 1;
+          report.ignoredAuditActions += reconstructed.ignoredAuditActions;
+          for (const [sequence, event] of reconstructed.events.entries()) {
+            const inserted = await client.query(
+              `INSERT INTO job_events (id,job_id,sequence,type,data,created_at)
+               VALUES ($1,$2,$3,'status',$4,$5)
+               ON CONFLICT (job_id, sequence) DO NOTHING`,
+              [
+                randomUUID(),
+                row.id,
+                sequence,
+                this.encrypt(event.data, `job:${row.id}:event:${sequence}:v2`),
+                event.createdAt,
+              ],
+            );
+            if (inserted.rowCount) {
+              report.insertedEvents += inserted.rowCount ?? 0;
+              if (event.source === "audit_events") report.auditDerivedEvents += 1;
+              else report.currentStatusEvents += 1;
+            }
+          }
+        }
+        console.info(`[persistence] historical job event recovery ${JSON.stringify(report)}`);
+        await client.query("INSERT INTO schema_migrations (version) VALUES (4)");
+      }
+      const accountMigration = await client.query(
+        "SELECT 1 FROM schema_migrations WHERE version=5",
+      );
+      if (!accountMigration.rowCount) {
+        for (const config of configuredChatGptWebAccountConfigs()) {
+          const account = defaultChatGptWebAccount(config);
+          await client.query(
+            `INSERT INTO chatgpt_web_accounts
+             (account_id,slot,label,plan,bridge_url,vnc_path,enabled,qualified,status,updated_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+             ON CONFLICT (account_id) DO UPDATE SET
+               slot=EXCLUDED.slot, bridge_url=EXCLUDED.bridge_url, vnc_path=EXCLUDED.vnc_path`,
+            [
+              account.accountId,
+              account.slot,
+              account.label,
+              account.plan,
+              account.bridgeUrl,
+              account.vncPath,
+              account.enabled,
+              account.qualified,
+              accountStatusWithoutBridge(account),
+              account.updatedAt,
+            ],
+          );
+        }
+        await client.query("INSERT INTO schema_migrations (version) VALUES (5)");
+      }
+      const routingWeightMigration = await client.query(
+        "SELECT 1 FROM schema_migrations WHERE version=6",
+      );
+      if (!routingWeightMigration.rowCount) {
+        const rows = await client.query("SELECT * FROM chatgpt_web_accounts ORDER BY slot ASC");
+        const weights = equalChatGptWebRoutingWeights(
+          rows.rows.map((row) => String(row.account_id)),
+        );
+        for (const row of rows.rows) {
+          const account = this.rowToChatGptWebAccount(row);
+          const updated = ChatGptWebAccountSchema.parse({
+            ...account,
+            routingWeight: weights[account.accountId] ?? 0,
+            updatedAt: new Date().toISOString(),
+          });
+          await client.query(
+            "UPDATE chatgpt_web_accounts SET status=$2, updated_at=$3 WHERE account_id=$1",
+            [updated.accountId, accountStatusWithoutBridge(updated), updated.updatedAt],
+          );
+        }
+        await client.query("INSERT INTO schema_migrations (version) VALUES (6)");
+      }
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async close(): Promise<void> {
+    await this.pool.end();
+  }
+
+  async create(job: Job): Promise<Job> {
+    const result = await this.pool.query(
+      `INSERT INTO jobs (
+        id, status, request_hash, idempotency_key, caller_id, task, route, output,
+        error_code, error_message, usage, validation, created_at, updated_at, expires_at
+      ) VALUES (
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
+      ) ON CONFLICT (caller_id, idempotency_key) DO NOTHING RETURNING *`,
+      [
+        job.id,
+        job.status,
+        job.requestHash,
+        job.idempotencyKey,
+        job.callerId,
+        this.encrypt(job.task, `job:${job.id}:task:v2`),
+        job.route,
+        job.output === null ? null : this.encrypt(job.output, `job:${job.id}:output:v2`),
+        job.errorCode,
+        job.errorMessage,
+        job.usage,
+        job.validation,
+        job.createdAt,
+        job.updatedAt,
+        job.expiresAt,
+      ],
+    );
+    if (result.rowCount) return this.rowToJob(result.rows[0]);
+    if (job.idempotencyKey) {
+      const existing = await this.findByIdempotency(job.callerId, job.idempotencyKey);
+      if (existing) return existing;
+    }
+    throw new Error("idempotency_conflict_without_job");
+  }
+
+  async createInitialJob(
+    job: Job,
+    creationAudit: AuditEvent,
+    transition: InitialJobTransition,
+  ): Promise<InitialJobResult> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const inserted = await client.query(
+        `INSERT INTO jobs (
+          id, status, request_hash, idempotency_key, caller_id, task, route, output,
+          error_code, error_message, usage, validation, created_at, updated_at, expires_at
+        ) VALUES (
+          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
+        ) ON CONFLICT (caller_id, idempotency_key) DO NOTHING RETURNING *`,
+        [
+          job.id,
+          job.status,
+          job.requestHash,
+          job.idempotencyKey,
+          job.callerId,
+          this.encrypt(job.task, `job:${job.id}:task:v2`),
+          job.route,
+          job.output === null ? null : this.encrypt(job.output, `job:${job.id}:output:v2`),
+          job.errorCode,
+          job.errorMessage,
+          job.usage,
+          job.validation,
+          job.createdAt,
+          job.updatedAt,
+          job.expiresAt,
+        ],
+      );
+      if (!inserted.rowCount) {
+        if (!job.idempotencyKey) throw new Error("idempotency_conflict_without_job");
+        const existing = await client.query(
+          "SELECT * FROM jobs WHERE caller_id=$1 AND idempotency_key=$2",
+          [job.callerId, job.idempotencyKey],
+        );
+        if (!existing.rowCount) throw new Error("idempotency_conflict_without_job");
+        await client.query("COMMIT");
+        return { job: this.rowToJob(existing.rows[0]), created: false };
+      }
+
+      await this.insertAudit(client, creationAudit);
+      await this.insertJobEvent(client, job.id, "status", { status: "accepted" }, job.createdAt);
+
+      const transitionedAt = new Date().toISOString();
+      const transitioned = await client.query(
+        `UPDATE jobs
+         SET status=$2, updated_at=$3, state_version=state_version+1
+         WHERE id=$1 RETURNING *`,
+        [job.id, transition.status, transitionedAt],
+      );
+      await this.insertJobEvent(
+        client,
+        job.id,
+        "status",
+        { status: transition.status },
+        transitionedAt,
+      );
+      for (const event of transition.events ?? []) {
+        await this.insertJobEvent(
+          client,
+          job.id,
+          event.type,
+          event.data,
+          event.createdAt ?? transitionedAt,
+        );
+      }
+      await this.insertAudit(client, transition.audit);
+      await transition.enqueue?.(this.transactionalSql(client));
+      await client.query("COMMIT");
+      return { job: this.rowToJob(transitioned.rows[0]), created: true };
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async transitionJob(
+    id: string,
+    patch: Partial<Job>,
+    audit: AuditEvent,
+    enqueue?: (transaction: TransactionalSql) => Promise<void>,
+  ): Promise<Job> {
+    if (!patch.status) throw new Error("job_status_required");
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [id]);
+      const currentResult = await client.query("SELECT * FROM jobs WHERE id=$1 FOR UPDATE", [id]);
+      if (!currentResult.rowCount) throw new Error("job_not_found");
+      const current = this.rowToJob(currentResult.rows[0]);
+      const next = { ...current, ...patch, updatedAt: new Date().toISOString() };
+      const updateResult = await client.query(
+        `UPDATE jobs SET status=$2, route=$3, output=$4, error_code=$5, error_message=$6,
+         usage=$7, validation=$8, task=$9, updated_at=$10, state_version=state_version+1
+         WHERE id=$1 RETURNING *`,
+        [
+          id,
+          next.status,
+          next.route,
+          next.output === null ? null : this.encrypt(next.output, `job:${next.id}:output:v2`),
+          next.errorCode,
+          next.errorMessage,
+          next.usage,
+          next.validation,
+          this.encrypt(next.task, `job:${next.id}:task:v2`),
+          next.updatedAt,
+        ],
+      );
+      const eventData = { status: next.status };
+      await this.insertJobEvent(client, id, "status", eventData, next.updatedAt);
+      await this.insertAudit(client, audit);
+      await enqueue?.(this.transactionalSql(client));
+      await client.query("COMMIT");
+      return this.rowToJob(updateResult.rows[0]);
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async claimJobForExecution(id: string, audit: AuditEvent): Promise<Job | null> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const currentResult = await client.query("SELECT * FROM jobs WHERE id=$1 FOR UPDATE", [id]);
+      if (!currentResult.rowCount || currentResult.rows[0].status !== "queued") {
+        await client.query("COMMIT");
+        return null;
+      }
+      const updatedAt = new Date().toISOString();
+      const updated = await client.query(
+        `UPDATE jobs SET status='running', updated_at=$2, state_version=state_version+1
+         WHERE id=$1 AND status='queued' RETURNING *`,
+        [id, updatedAt],
+      );
+      if (!updated.rowCount) {
+        await client.query("ROLLBACK");
+        return null;
+      }
+      await this.insertJobEvent(client, id, "status", { status: "running" }, updatedAt);
+      await this.insertAudit(client, audit);
+      await client.query("COMMIT");
+      return this.rowToJob(updated.rows[0]);
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async expireRunningJob(id: string, audit: AuditEvent): Promise<Job | null> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const currentResult = await client.query("SELECT * FROM jobs WHERE id=$1 FOR UPDATE", [id]);
+      if (!currentResult.rowCount || currentResult.rows[0].status !== "running") {
+        await client.query("COMMIT");
+        return null;
+      }
+      const updatedAt = new Date().toISOString();
+      const updated = await client.query(
+        `UPDATE jobs
+         SET status='expired', error_code='worker_execution_interrupted',
+             error_message='The Worker stopped before it could record a terminal provider result.',
+             updated_at=$2, state_version=state_version+1
+         WHERE id=$1 AND status='running' RETURNING *`,
+        [id, updatedAt],
+      );
+      if (!updated.rowCount) {
+        await client.query("ROLLBACK");
+        return null;
+      }
+      await this.insertJobEvent(client, id, "status", { status: "expired" }, updatedAt);
+      await this.insertAudit(client, audit);
+      await client.query("COMMIT");
+      return this.rowToJob(updated.rows[0]);
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async findById(id: string): Promise<Job | null> {
+    const result = await this.pool.query("SELECT * FROM jobs WHERE id = $1", [id]);
+    return result.rowCount ? this.rowToJob(result.rows[0]) : null;
+  }
+
+  async findByIdempotency(callerId: string, key: string): Promise<Job | null> {
+    const result = await this.pool.query(
+      "SELECT * FROM jobs WHERE caller_id = $1 AND idempotency_key = $2",
+      [callerId, key],
+    );
+    return result.rowCount ? this.rowToJob(result.rows[0]) : null;
+  }
+
+  async list(limit = 100): Promise<Job[]> {
+    const result = await this.pool.query("SELECT * FROM jobs ORDER BY created_at DESC LIMIT $1", [
+      Math.min(limit, 500),
+    ]);
+    return result.rows.map((row) => this.rowToJob(row));
+  }
+
+  async update(id: string, patch: Partial<Job>): Promise<Job> {
+    const current = await this.findById(id);
+    if (!current) {
+      throw new Error("job_not_found");
+    }
+    const next = { ...current, ...patch, updatedAt: new Date().toISOString() };
+    const result = await this.pool.query(
+      `UPDATE jobs SET status=$2, route=$3, output=$4, error_code=$5, error_message=$6,
+       usage=$7, validation=$8, task=$9, updated_at=$10 WHERE id=$1 RETURNING *`,
+      [
+        id,
+        next.status,
+        next.route,
+        next.output === null ? null : this.encrypt(next.output, `job:${next.id}:output:v2`),
+        next.errorCode,
+        next.errorMessage,
+        next.usage,
+        next.validation,
+        this.encrypt(next.task, `job:${next.id}:task:v2`),
+        next.updatedAt,
+      ],
+    );
+    return this.rowToJob(result.rows[0]);
+  }
+
+  async appendEvent(
+    jobId: string,
+    type: JobEvent["type"],
+    data: Record<string, unknown>,
+  ): Promise<JobEvent> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const event = await this.insertJobEvent(client, jobId, type, data);
+      await client.query("COMMIT");
+      return event;
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async events(jobId: string, afterSequence = -1): Promise<JobEvent[]> {
+    const result = await this.pool.query(
+      "SELECT * FROM job_events WHERE job_id = $1 AND sequence > $2 ORDER BY sequence ASC",
+      [jobId, afterSequence],
+    );
+    return result.rows.map((row) => ({
+      id: row.id,
+      jobId: row.job_id,
+      sequence: row.sequence,
+      type: row.type,
+      data: this.decrypt(row.data, `job:${row.job_id}:event:${row.sequence}:v2`),
+      createdAt: new Date(row.created_at).toISOString(),
+    }));
+  }
+
+  async eventsForJobs(jobIds: string[]): Promise<Map<string, JobEvent[]>> {
+    if (!jobIds.length) return new Map();
+    const result = await this.pool.query(
+      "SELECT * FROM job_events WHERE job_id=ANY($1::uuid[]) ORDER BY job_id, sequence ASC",
+      [jobIds],
+    );
+    const eventsByJob = new Map<string, JobEvent[]>(jobIds.map((jobId) => [jobId, []]));
+    for (const row of result.rows) {
+      const event: JobEvent = {
+        id: row.id,
+        jobId: row.job_id,
+        sequence: row.sequence,
+        type: row.type,
+        data: this.decrypt(row.data, `job:${row.job_id}:event:${row.sequence}:v2`),
+        createdAt: new Date(row.created_at).toISOString(),
+      };
+      eventsByJob.get(event.jobId)?.push(event);
+    }
+    return eventsByJob;
+  }
+
+  async saveQuotaSnapshot(snapshot: QuotaSnapshot): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const current = await client.query(
+        "SELECT snapshot FROM quota_current WHERE provider=$1 FOR UPDATE",
+        [snapshot.provider],
+      );
+      const previous = current.rowCount ? (current.rows[0].snapshot as QuotaSnapshot) : null;
+      const changed =
+        !previous ||
+        JSON.stringify({ ...previous, fetchedAt: null, stale: null }) !==
+          JSON.stringify({ ...snapshot, fetchedAt: null, stale: null });
+      await client.query(
+        `INSERT INTO quota_current (provider, snapshot, updated_at) VALUES ($1,$2,$3)
+         ON CONFLICT (provider) DO UPDATE SET snapshot=EXCLUDED.snapshot, updated_at=EXCLUDED.updated_at`,
+        [snapshot.provider, snapshot, snapshot.fetchedAt],
+      );
+      if (changed) {
+        await client.query(
+          "INSERT INTO quota_snapshots (id, provider, snapshot, created_at) VALUES ($1,$2,$3,$4)",
+          [randomUUID(), snapshot.provider, snapshot, snapshot.fetchedAt],
+        );
+      }
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async latestQuotaSnapshot(): Promise<QuotaSnapshot | null> {
+    const current = await this.pool.query(
+      "SELECT snapshot FROM quota_current WHERE provider='codex'",
+    );
+    if (current.rowCount) return current.rows[0].snapshot as QuotaSnapshot;
+    const history = await this.pool.query(
+      "SELECT snapshot FROM quota_snapshots WHERE provider='codex' ORDER BY created_at DESC LIMIT 1",
+    );
+    return history.rowCount ? (history.rows[0].snapshot as QuotaSnapshot) : null;
+  }
+
+  async saveModelCatalog(snapshot: ModelCatalogSnapshot): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO model_catalog_current (provider, snapshot, updated_at) VALUES ('codex',$1,$2)
+       ON CONFLICT (provider) DO UPDATE SET snapshot=EXCLUDED.snapshot, updated_at=EXCLUDED.updated_at`,
+      [snapshot, snapshot.fetchedAt],
+    );
+  }
+
+  async latestModelCatalog(): Promise<ModelCatalogSnapshot | null> {
+    const result = await this.pool.query(
+      "SELECT snapshot FROM model_catalog_current WHERE provider='codex'",
+    );
+    return result.rowCount ? (result.rows[0].snapshot as ModelCatalogSnapshot) : null;
+  }
+
+  async readChatGptWebStatus(): Promise<ChatGptWebStatus> {
+    const result = await this.pool.query(
+      "SELECT status FROM chatgpt_web_status WHERE singleton=TRUE",
+    );
+    return result.rowCount
+      ? parseChatGptWebStatus(result.rows[0].status)
+      : defaultChatGptWebStatus();
+  }
+
+  async saveChatGptWebStatus(status: ChatGptWebStatus): Promise<void> {
+    const parsed = parseChatGptWebStatus(status);
+    await this.pool.query(
+      `INSERT INTO chatgpt_web_status (singleton,status,updated_at)
+       VALUES (TRUE,$1,$2)
+       ON CONFLICT (singleton) DO UPDATE SET status=EXCLUDED.status,updated_at=EXCLUDED.updated_at`,
+      [parsed, parsed.updatedAt],
+    );
+  }
+
+  private rowToChatGptWebAccount(row: Record<string, any>): ChatGptWebAccountRecord {
+    const status = ChatGptWebAccountSchema.parse({
+      ...(row.status ?? {}),
+      accountId: row.account_id,
+      slot: row.slot,
+      label: row.label,
+      plan: row.plan,
+      enabled: row.enabled,
+      qualified: row.qualified,
+      activeJobId: row.lease_job_id ?? null,
+      leaseExpiresAt: row.lease_expires_at ? new Date(row.lease_expires_at).toISOString() : null,
+      leaseEpoch: Number(row.lease_epoch ?? 0),
+      stateVersion: Number(row.state_version ?? 0),
+      vncPath: row.vnc_path,
+      updatedAt: new Date(row.updated_at).toISOString(),
+    });
+    return { ...status, bridgeUrl: row.bridge_url };
+  }
+
+  async listChatGptWebAccounts(): Promise<ChatGptWebAccountRecord[]> {
+    const result = await this.pool.query("SELECT * FROM chatgpt_web_accounts ORDER BY slot ASC");
+    return result.rows.map((row) => this.rowToChatGptWebAccount(row));
+  }
+
+  async findChatGptWebAccount(accountId: string): Promise<ChatGptWebAccountRecord | null> {
+    const result = await this.pool.query("SELECT * FROM chatgpt_web_accounts WHERE account_id=$1", [
+      accountId,
+    ]);
+    return result.rowCount ? this.rowToChatGptWebAccount(result.rows[0]) : null;
+  }
+
+  async syncChatGptWebAccounts(configs: ChatGptWebAccountConfig[]): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      for (const config of configs) {
+        const account = defaultChatGptWebAccount(config);
+        await client.query(
+          `INSERT INTO chatgpt_web_accounts
+           (account_id,slot,label,plan,bridge_url,vnc_path,enabled,qualified,status,updated_at)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+           ON CONFLICT (account_id) DO UPDATE SET
+             slot=EXCLUDED.slot, bridge_url=EXCLUDED.bridge_url, vnc_path=EXCLUDED.vnc_path`,
+          [
+            account.accountId,
+            account.slot,
+            account.label,
+            account.plan,
+            account.bridgeUrl,
+            account.vncPath,
+            account.enabled,
+            account.qualified,
+            accountStatusWithoutBridge(account),
+            account.updatedAt,
+          ],
+        );
+      }
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async updateChatGptWebAccount(
+    accountId: string,
+    patch: ChatGptWebAccountPatch,
+  ): Promise<ChatGptWebAccountRecord> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const currentResult = await client.query(
+        "SELECT * FROM chatgpt_web_accounts WHERE account_id=$1 FOR UPDATE",
+        [accountId],
+      );
+      if (!currentResult.rowCount) throw new Error("chatgpt_web_account_not_found");
+      const current = this.rowToChatGptWebAccount(currentResult.rows[0]);
+      const updated = ChatGptWebAccountSchema.parse({
+        ...current,
+        ...patch,
+        accountId: current.accountId,
+        slot: current.slot,
+        vncPath: current.vncPath,
+        updatedAt: new Date().toISOString(),
+      });
+      const result = await client.query(
+        `UPDATE chatgpt_web_accounts SET
+           label=$2, plan=$3, enabled=$4, qualified=$5, status=$6,
+           lease_job_id=$7, lease_expires_at=$8, updated_at=$9
+         WHERE account_id=$1 RETURNING *`,
+        [
+          accountId,
+          updated.label,
+          updated.plan,
+          updated.enabled,
+          updated.qualified,
+          accountStatusWithoutBridge(updated),
+          updated.activeJobId,
+          updated.leaseExpiresAt,
+          updated.updatedAt,
+        ],
+      );
+      await client.query("COMMIT");
+      return this.rowToChatGptWebAccount(result.rows[0]);
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async updateChatGptWebRoutingWeights(
+    weights: Record<string, number>,
+  ): Promise<ChatGptWebAccountRecord[]> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await client.query(
+        "SELECT * FROM chatgpt_web_accounts ORDER BY slot FOR UPDATE",
+      );
+      const accounts = result.rows.map((row) => this.rowToChatGptWebAccount(row));
+      assertRoutingWeights(accounts, weights);
+      const now = new Date().toISOString();
+      for (const account of accounts) {
+        const updated = ChatGptWebAccountSchema.parse({
+          ...account,
+          routingWeight: weights[account.accountId],
+          updatedAt: now,
+        });
+        await client.query(
+          "UPDATE chatgpt_web_accounts SET status=$2, updated_at=$3 WHERE account_id=$1",
+          [account.accountId, accountStatusWithoutBridge(updated), now],
+        );
+      }
+      await client.query("COMMIT");
+      return this.listChatGptWebAccounts();
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async acquireChatGptWebAccountLease(
+    jobId: string,
+    accountIds: string[],
+    now: Date,
+    leaseMs: number,
+  ): Promise<ChatGptWebAccountRecord | null> {
+    if (!accountIds.length) return null;
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const expired = await client.query(
+        `SELECT * FROM chatgpt_web_accounts
+         WHERE account_id=ANY($1::text[]) AND lease_job_id IS NOT NULL
+           AND lease_expires_at <= $2 FOR UPDATE`,
+        [accountIds, now],
+      );
+      for (const row of expired.rows) {
+        const current = this.rowToChatGptWebAccount(row);
+        const isolated = ChatGptWebAccountSchema.parse({
+          ...current,
+          qualified: false,
+          state: "quarantined",
+          activeJobId: null,
+          leaseExpiresAt: null,
+          lastFailureAt: now.toISOString(),
+          lastFailureCode: "chatgpt_lease_expired",
+          updatedAt: now.toISOString(),
+        });
+        await client.query(
+          `UPDATE chatgpt_web_accounts SET qualified=false, status=$2,
+             lease_job_id=NULL, lease_expires_at=NULL, updated_at=$3 WHERE account_id=$1`,
+          [current.accountId, accountStatusWithoutBridge(isolated), now],
+        );
+      }
+      const result = await client.query(
+        `SELECT * FROM chatgpt_web_accounts
+         WHERE account_id=ANY($1::text[])
+           AND enabled=true AND qualified=true AND status->>'state'='ready'
+           AND lease_job_id IS NULL
+           AND COALESCE(status->>'rateLimitState','clear') NOT IN ('cooldown','recovery_probe')
+         AND (status->>'lastSubmissionAt' IS NULL OR
+                (status->>'lastSubmissionAt')::timestamptz <=
+                  $2::timestamptz - INTERVAL '90 seconds')
+         ORDER BY slot`,
+        [accountIds, now],
+      );
+      if (!result.rowCount) {
+        await client.query("COMMIT");
+        return null;
+      }
+      const candidates = rankWeightedChatGptWebAccounts(
+        jobId,
+        result.rows.map((row) => this.rowToChatGptWebAccount(row)),
+      );
+      let current: ChatGptWebAccountRecord | null = null;
+      for (const candidate of candidates) {
+        const locked = await client.query(
+          `SELECT * FROM chatgpt_web_accounts
+           WHERE account_id=$1
+           FOR UPDATE SKIP LOCKED`,
+          [candidate.accountId],
+        );
+        if (!locked.rowCount) continue;
+        const latest = this.rowToChatGptWebAccount(locked.rows[0]);
+        if (
+          !accountIds.includes(latest.accountId) ||
+          !latest.enabled ||
+          !latest.qualified ||
+          latest.state !== "ready" ||
+          latest.activeJobId !== null ||
+          latest.rateLimitState === "cooldown" ||
+          latest.rateLimitState === "recovery_probe" ||
+          (latest.lastSubmissionAt &&
+            new Date(latest.lastSubmissionAt).getTime() > now.getTime() - 90_000)
+        ) {
+          continue;
+        }
+        current = latest;
+        break;
+      }
+      if (!current) {
+        await client.query("COMMIT");
+        return null;
+      }
+      const leased = ChatGptWebAccountSchema.parse({
+        ...current,
+        state: "busy",
+        activeJobId: jobId,
+        leaseExpiresAt: new Date(now.getTime() + leaseMs).toISOString(),
+        leaseEpoch: current.leaseEpoch + 1,
+        stateVersion: current.stateVersion + 1,
+        updatedAt: now.toISOString(),
+      });
+      const updated = await client.query(
+        `UPDATE chatgpt_web_accounts SET status=$2, lease_job_id=$3,
+           lease_expires_at=$4, lease_epoch=$6, state_version=$7, updated_at=$5
+         WHERE account_id=$1 RETURNING *`,
+        [
+          current.accountId,
+          accountStatusWithoutBridge(leased),
+          jobId,
+          leased.leaseExpiresAt,
+          leased.updatedAt,
+          leased.leaseEpoch,
+          leased.stateVersion,
+        ],
+      );
+      await client.query("COMMIT");
+      return this.rowToChatGptWebAccount(updated.rows[0]);
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async renewChatGptWebAccountLease(
+    accountId: string,
+    jobId: string,
+    leaseEpoch: number,
+    now: Date,
+    leaseMs: number,
+  ): Promise<boolean> {
+    const leaseExpiresAt = new Date(now.getTime() + leaseMs).toISOString();
+    const result = await this.pool.query(
+      `UPDATE chatgpt_web_accounts
+       SET lease_expires_at=$5::timestamptz, updated_at=$4::timestamptz,
+           status=status || jsonb_build_object('leaseExpiresAt',$5::text,'updatedAt',$4::text)
+       WHERE account_id=$1 AND lease_job_id=$2 AND lease_epoch=$3
+         AND lease_expires_at > $4::timestamptz`,
+      [accountId, jobId, leaseEpoch, now, leaseExpiresAt],
+    );
+    return (result.rowCount ?? 0) === 1;
+  }
+
+  async releaseChatGptWebAccountLease(
+    accountId: string,
+    jobId: string,
+    leaseEpoch: number,
+    patch: ChatGptWebAccountPatch = {},
+  ): Promise<ChatGptWebAccountRecord | null> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await client.query(
+        "SELECT * FROM chatgpt_web_accounts WHERE account_id=$1 FOR UPDATE",
+        [accountId],
+      );
+      if (!result.rowCount) {
+        await client.query("COMMIT");
+        return null;
+      }
+      const current = this.rowToChatGptWebAccount(result.rows[0]);
+      if (current.activeJobId !== jobId || current.leaseEpoch !== leaseEpoch) {
+        await client.query("COMMIT");
+        return null;
+      }
+      const updated = ChatGptWebAccountSchema.parse({
+        ...current,
+        ...patch,
+        accountId: current.accountId,
+        slot: current.slot,
+        vncPath: current.vncPath,
+        activeJobId: null,
+        leaseExpiresAt: null,
+        stateVersion: current.stateVersion + 1,
+        updatedAt: new Date().toISOString(),
+      });
+      const saved = await client.query(
+        `UPDATE chatgpt_web_accounts SET label=$2, plan=$3, enabled=$4,
+           qualified=$5, status=$6, lease_job_id=NULL, lease_expires_at=NULL,
+           state_version=$8, updated_at=$7
+         WHERE account_id=$1 AND lease_epoch=$9 RETURNING *`,
+        [
+          accountId,
+          updated.label,
+          updated.plan,
+          updated.enabled,
+          updated.qualified,
+          accountStatusWithoutBridge(updated),
+          updated.updatedAt,
+          updated.stateVersion,
+          leaseEpoch,
+        ],
+      );
+      await client.query("COMMIT");
+      return this.rowToChatGptWebAccount(saved.rows[0]);
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async createChatGptWebSubmitIntent(
+    intent: ChatGptWebSubmitIntent,
+  ): Promise<ChatGptWebSubmitIntent> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 1))", [intent.jobId]);
+      const requestedAccount = await client.query(
+        `SELECT account_id FROM chatgpt_web_accounts
+         WHERE account_id=$1 AND lease_job_id=$2 AND lease_epoch=$3
+           AND lease_expires_at > NOW()
+         FOR UPDATE`,
+        [intent.accountId, intent.jobId, intent.leaseEpoch],
+      );
+      if (!requestedAccount.rowCount) throw new Error("chatgpt_lease_lost");
+
+      const existing = await client.query(
+        "SELECT * FROM chatgpt_web_submit_intents WHERE job_id=$1 FOR UPDATE",
+        [intent.jobId],
+      );
+      let result;
+      if (existing.rowCount) {
+        const previous = existing.rows[0];
+        if (previous.state !== "prepared") throw new Error("chatgpt_submission_already_started");
+        const previousLease = await client.query(
+          `SELECT account_id FROM chatgpt_web_accounts
+           WHERE account_id=$1 AND lease_job_id=$2 AND lease_epoch=$3
+             AND lease_expires_at > NOW()
+           FOR UPDATE`,
+          [previous.account_id, previous.job_id, previous.lease_epoch],
+        );
+        if (previousLease.rowCount) throw new Error("chatgpt_submission_already_started");
+        result = await client.query(
+          `UPDATE chatgpt_web_submit_intents
+           SET intent_id=$2,account_id=$3,lease_epoch=$4,state=$5,phase_sequence=$6,
+               deadline_at=$7,created_at=$8,updated_at=$9
+           WHERE job_id=$1 RETURNING *`,
+          [
+            intent.jobId,
+            intent.intentId,
+            intent.accountId,
+            intent.leaseEpoch,
+            intent.state,
+            intent.phaseSequence,
+            intent.deadlineAt,
+            intent.createdAt,
+            intent.updatedAt,
+          ],
+        );
+      } else {
+        result = await client.query(
+          `INSERT INTO chatgpt_web_submit_intents (
+             intent_id,job_id,account_id,lease_epoch,state,phase_sequence,
+             deadline_at,created_at,updated_at
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+           RETURNING *`,
+          [
+            intent.intentId,
+            intent.jobId,
+            intent.accountId,
+            intent.leaseEpoch,
+            intent.state,
+            intent.phaseSequence,
+            intent.deadlineAt,
+            intent.createdAt,
+            intent.updatedAt,
+          ],
+        );
+      }
+      await client.query("COMMIT");
+      return this.rowToChatGptWebSubmitIntent(result.rows[0]);
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async advanceChatGptWebSubmitIntent(
+    intentId: string,
+    leaseEpoch: number,
+    state: ChatGptWebSubmitIntentState,
+    phaseSequence: number,
+  ): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE chatgpt_web_submit_intents
+       SET state=$3, phase_sequence=$4, updated_at=NOW()
+       WHERE intent_id=$1 AND lease_epoch=$2 AND phase_sequence < $4
+          AND state NOT IN ('completed','failed')
+          AND EXISTS (
+            SELECT 1 FROM chatgpt_web_accounts account
+            WHERE account.account_id=chatgpt_web_submit_intents.account_id
+              AND account.lease_job_id=chatgpt_web_submit_intents.job_id
+              AND account.lease_epoch=$2
+              AND account.lease_expires_at > NOW()
+          )`,
+      [intentId, leaseEpoch, state, phaseSequence],
+    );
+    return (result.rowCount ?? 0) === 1;
+  }
+
+  private rowToChatGptWebSubmitIntent(row: Record<string, any>): ChatGptWebSubmitIntent {
+    return {
+      intentId: String(row.intent_id),
+      jobId: String(row.job_id),
+      accountId: String(row.account_id),
+      leaseEpoch: Number(row.lease_epoch),
+      state: row.state as ChatGptWebSubmitIntentState,
+      phaseSequence: Number(row.phase_sequence),
+      deadlineAt: new Date(row.deadline_at).toISOString(),
+      createdAt: new Date(row.created_at).toISOString(),
+      updatedAt: new Date(row.updated_at).toISOString(),
+    };
+  }
+
+  async createChatGptWebQualificationRun(
+    run: ChatGptWebQualificationRun,
+  ): Promise<ChatGptWebQualificationRun> {
+    const parsed = ChatGptWebQualificationRunSchema.parse(run);
+    await this.pool.query(
+      `INSERT INTO chatgpt_web_qualification_runs (id,run,created_at,updated_at)
+       VALUES ($1,$2,$3,$4)`,
+      [parsed.id, parsed, parsed.createdAt, parsed.updatedAt],
+    );
+    return parsed;
+  }
+
+  async findChatGptWebQualificationRun(id: string): Promise<ChatGptWebQualificationRun | null> {
+    const result = await this.pool.query(
+      "SELECT run FROM chatgpt_web_qualification_runs WHERE id=$1",
+      [id],
+    );
+    return result.rowCount ? ChatGptWebQualificationRunSchema.parse(result.rows[0].run) : null;
+  }
+
+  async updateChatGptWebQualificationRun(
+    id: string,
+    patch: Partial<ChatGptWebQualificationRun>,
+  ): Promise<ChatGptWebQualificationRun> {
+    const current = await this.findChatGptWebQualificationRun(id);
+    if (!current) throw new Error("chatgpt_web_qualification_not_found");
+    const updated = ChatGptWebQualificationRunSchema.parse({
+      ...current,
+      ...patch,
+      id,
+      updatedAt: new Date().toISOString(),
+    });
+    await this.pool.query(
+      "UPDATE chatgpt_web_qualification_runs SET run=$2,updated_at=$3 WHERE id=$1",
+      [id, updated, updated.updatedAt],
+    );
+    return updated;
+  }
+
+  async listChatGptWebQualificationRuns(limit = 20): Promise<ChatGptWebQualificationRun[]> {
+    const result = await this.pool.query(
+      "SELECT run FROM chatgpt_web_qualification_runs ORDER BY created_at DESC LIMIT $1",
+      [Math.min(limit, 100)],
+    );
+    return result.rows.map((row) => ChatGptWebQualificationRunSchema.parse(row.run));
+  }
+
+  async listModelSettings(): Promise<ModelSetting[]> {
+    const result = await this.pool.query("SELECT * FROM model_settings ORDER BY model_id");
+    return result.rows.map((row) => ({
+      modelId: row.model_id,
+      enabled: row.enabled,
+      updatedAt: new Date(row.updated_at).toISOString(),
+      updatedBy: row.updated_by,
+    }));
+  }
+
+  async setModelEnabled(modelId: string, enabled: boolean, actorId: string): Promise<ModelSetting> {
+    const result = await this.pool.query(
+      `INSERT INTO model_settings (model_id, enabled, updated_at, updated_by) VALUES ($1,$2,NOW(),$3)
+       ON CONFLICT (model_id) DO UPDATE SET enabled=EXCLUDED.enabled,
+         updated_at=EXCLUDED.updated_at, updated_by=EXCLUDED.updated_by RETURNING *`,
+      [modelId, enabled, actorId],
+    );
+    const row = result.rows[0];
+    return {
+      modelId: row.model_id,
+      enabled: row.enabled,
+      updatedAt: new Date(row.updated_at).toISOString(),
+      updatedBy: row.updated_by,
+    };
+  }
+
+  async setModelEnabledIdempotent(
+    modelId: string,
+    enabled: boolean,
+    actorId: string,
+    idempotencyKey: string,
+    requestHashValue: string,
+  ): Promise<ModelSettingResult> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const prior = await client.query(
+        "SELECT request_hash, response FROM model_setting_requests WHERE actor_id=$1 AND idempotency_key=$2 FOR UPDATE",
+        [actorId, idempotencyKey],
+      );
+      if (prior.rowCount) {
+        if (prior.rows[0].request_hash !== requestHashValue)
+          throw new Error("idempotency_conflict");
+        await client.query("COMMIT");
+        return { setting: prior.rows[0].response as ModelSetting, replayed: true };
+      }
+      const updated = await client.query(
+        `INSERT INTO model_settings (model_id, enabled, updated_at, updated_by) VALUES ($1,$2,NOW(),$3)
+         ON CONFLICT (model_id) DO UPDATE SET enabled=EXCLUDED.enabled,
+           updated_at=EXCLUDED.updated_at, updated_by=EXCLUDED.updated_by RETURNING *`,
+        [modelId, enabled, actorId],
+      );
+      const row = updated.rows[0];
+      const setting: ModelSetting = {
+        modelId: row.model_id,
+        enabled: row.enabled,
+        updatedAt: new Date(row.updated_at).toISOString(),
+        updatedBy: row.updated_by,
+      };
+      await client.query(
+        "INSERT INTO model_setting_requests (actor_id,idempotency_key,request_hash,response,created_at) VALUES ($1,$2,$3,$4,NOW())",
+        [actorId, idempotencyKey, requestHashValue, setting],
+      );
+      await client.query("COMMIT");
+      return { setting, replayed: false };
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  private rowToSessionThread(row: Record<string, any>): SessionThread {
+    return {
+      sessionKey: row.session_key,
+      callerId: row.caller_id,
+      model: row.model,
+      effort: row.effort,
+      turnCount: Number(row.turn_count),
+      createdAt: new Date(row.created_at).toISOString(),
+      lastUsedAt: new Date(row.last_used_at).toISOString(),
+      expiresAt: new Date(row.expires_at).toISOString(),
+    };
+  }
+
+  async upsertSessionThread(thread: SessionThread): Promise<SessionThread> {
+    const result = await this.pool.query(
+      `INSERT INTO session_threads (
+        session_key, caller_id, model, effort, turn_count, created_at, last_used_at, expires_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+      ON CONFLICT (session_key) DO UPDATE SET
+        caller_id=EXCLUDED.caller_id,
+        model=EXCLUDED.model,
+        effort=EXCLUDED.effort,
+        turn_count=EXCLUDED.turn_count,
+        created_at=EXCLUDED.created_at,
+        last_used_at=EXCLUDED.last_used_at,
+        expires_at=EXCLUDED.expires_at
+      RETURNING *`,
+      [
+        thread.sessionKey,
+        thread.callerId,
+        thread.model,
+        thread.effort,
+        thread.turnCount,
+        thread.createdAt,
+        thread.lastUsedAt,
+        thread.expiresAt,
+      ],
+    );
+    return this.rowToSessionThread(result.rows[0]);
+  }
+
+  async findSessionThread(sessionKey: string): Promise<SessionThread | null> {
+    const result = await this.pool.query("SELECT * FROM session_threads WHERE session_key=$1", [
+      sessionKey,
+    ]);
+    return result.rowCount ? this.rowToSessionThread(result.rows[0]) : null;
+  }
+
+  async listSessionThreads(
+    actorId: string,
+    isAdmin: boolean,
+    limit = 100,
+  ): Promise<SessionThread[]> {
+    const result = await this.pool.query(
+      isAdmin
+        ? "SELECT * FROM session_threads ORDER BY last_used_at DESC LIMIT $1"
+        : "SELECT * FROM session_threads WHERE caller_id=$1 ORDER BY last_used_at DESC LIMIT $2",
+      isAdmin ? [Math.min(limit, 500)] : [actorId, Math.min(limit, 500)],
+    );
+    return result.rows.map((row) => this.rowToSessionThread(row));
+  }
+
+  async deleteExpiredSessionThreads(now: Date): Promise<number> {
+    const result = await this.pool.query("DELETE FROM session_threads WHERE expires_at <= $1", [
+      now.toISOString(),
+    ]);
+    return result.rowCount ?? 0;
+  }
+
+  async createApiKey(record: StoredApiKey): Promise<StoredApiKey> {
+    const result = await this.pool.query(
+      `INSERT INTO api_keys (
+        id, created_by, name, prefix, digest, scopes, execution_channels, execution_default_preset,
+        execution_allowed_presets, rate_limit_per_minute, expires_at, revoked_at, created_at,
+        last_used_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
+      [
+        record.id,
+        record.createdBy,
+        record.name,
+        record.prefix,
+        record.digest,
+        record.scopes,
+        record.executionChannels,
+        record.executionPolicy.defaultPreset,
+        record.executionPolicy.allowedPresets,
+        record.rateLimitPerMinute,
+        record.expiresAt,
+        record.revokedAt,
+        record.createdAt,
+        record.lastUsedAt,
+      ],
+    );
+    return this.rowToApiKey(result.rows[0]);
+  }
+
+  async createApiKeyIdempotent(
+    actorId: string,
+    idempotencyKey: string,
+    requestHashValue: string,
+    record: StoredApiKey,
+    plaintext: string,
+  ): Promise<ApiKeyCreationResult> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [
+        `api-key:${actorId}:${idempotencyKey}`,
+      ]);
+      const existing = await client.query(
+        "SELECT request_hash, response FROM api_key_requests WHERE actor_id=$1 AND idempotency_key=$2",
+        [actorId, idempotencyKey],
+      );
+      if (existing.rowCount) {
+        if (existing.rows[0].request_hash !== requestHashValue) {
+          throw new Error("idempotency_conflict");
+        }
+        const saved = this.decrypt<{ record: StoredApiKey; plaintext: string }>(
+          existing.rows[0].response,
+          `api-key-request:${actorId}:${idempotencyKey}:v2`,
+        );
+        saved.record.executionPolicy ??= {
+          defaultPreset: saved.record.scopes.includes("admin") ? "full" : "restricted",
+          allowedPresets: saved.record.scopes.includes("admin")
+            ? ["restricted", "confirm", "full"]
+            : ["restricted"],
+        };
+        saved.record.executionChannels ??=
+          saved.record.scopes.includes("admin") || saved.record.scopes.includes("chatgpt:web")
+            ? ["codex", "chatgpt_web"]
+            : ["codex"];
+        await client.query("COMMIT");
+        return { ...saved, replayed: true };
+      }
+      await client.query(
+        `INSERT INTO api_keys (
+          id, created_by, name, prefix, digest, scopes, execution_channels, execution_default_preset,
+          execution_allowed_presets, rate_limit_per_minute, expires_at, revoked_at, created_at,
+          last_used_at
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+        [
+          record.id,
+          record.createdBy,
+          record.name,
+          record.prefix,
+          record.digest,
+          record.scopes,
+          record.executionChannels,
+          record.executionPolicy.defaultPreset,
+          record.executionPolicy.allowedPresets,
+          record.rateLimitPerMinute,
+          record.expiresAt,
+          record.revokedAt,
+          record.createdAt,
+          record.lastUsedAt,
+        ],
+      );
+      await client.query(
+        `INSERT INTO api_key_requests
+          (actor_id,idempotency_key,request_hash,api_key_id,response,created_at)
+         VALUES ($1,$2,$3,$4,$5,$6)`,
+        [
+          actorId,
+          idempotencyKey,
+          requestHashValue,
+          record.id,
+          this.encrypt({ record, plaintext }, `api-key-request:${actorId}:${idempotencyKey}:v2`),
+          record.createdAt,
+        ],
+      );
+      await client.query("COMMIT");
+      return { record, plaintext, replayed: false };
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  private rowToApiKey(row: Record<string, any>): StoredApiKey {
+    return {
+      id: row.id,
+      createdBy: row.created_by,
+      name: row.name,
+      prefix: row.prefix,
+      digest: row.digest,
+      scopes: row.scopes,
+      executionChannels:
+        row.execution_channels ??
+        (row.scopes.includes("admin") || row.scopes.includes("chatgpt:web")
+          ? ["codex", "chatgpt_web"]
+          : ["codex"]),
+      executionPolicy: {
+        defaultPreset: row.execution_default_preset ?? "restricted",
+        allowedPresets: row.execution_allowed_presets ?? ["restricted"],
+      },
+      rateLimitPerMinute: row.rate_limit_per_minute,
+      expiresAt: row.expires_at ? new Date(row.expires_at).toISOString() : null,
+      revokedAt: row.revoked_at ? new Date(row.revoked_at).toISOString() : null,
+      createdAt: new Date(row.created_at).toISOString(),
+      lastUsedAt: row.last_used_at ? new Date(row.last_used_at).toISOString() : null,
+    };
+  }
+
+  async findApiKeyByPrefix(prefix: string): Promise<StoredApiKey | null> {
+    const result = await this.pool.query("SELECT * FROM api_keys WHERE prefix=$1", [prefix]);
+    return result.rowCount ? this.rowToApiKey(result.rows[0]) : null;
+  }
+
+  async findApiKeyById(id: string): Promise<StoredApiKey | null> {
+    const result = await this.pool.query("SELECT * FROM api_keys WHERE id=$1", [id]);
+    return result.rowCount ? this.rowToApiKey(result.rows[0]) : null;
+  }
+
+  async listApiKeys(): Promise<ApiKeyMetadata[]> {
+    const result = await this.pool.query("SELECT * FROM api_keys ORDER BY created_at DESC");
+    return result.rows.map((row) => apiKeyWithoutDigest(this.rowToApiKey(row)));
+  }
+
+  async listApiKeysForActor(actorId: string, isAdmin: boolean): Promise<ApiKeyMetadata[]> {
+    const result = await this.pool.query(
+      isAdmin
+        ? "SELECT * FROM api_keys ORDER BY created_at DESC"
+        : "SELECT * FROM api_keys WHERE created_by=$1 ORDER BY created_at DESC",
+      isAdmin ? [] : [actorId],
+    );
+    return result.rows.map((row) => apiKeyWithoutDigest(this.rowToApiKey(row)));
+  }
+
+  async touchApiKey(id: string): Promise<void> {
+    await this.pool.query("UPDATE api_keys SET last_used_at=NOW() WHERE id=$1", [id]);
+  }
+
+  async revokeApiKey(id: string): Promise<void> {
+    await this.pool.query("UPDATE api_keys SET revoked_at=NOW() WHERE id=$1", [id]);
+  }
+
+  async apiKeyCount(): Promise<number> {
+    const result = await this.pool.query("SELECT COUNT(*)::integer AS count FROM api_keys");
+    return Number(result.rows[0].count);
+  }
+
+  async activeAdminApiKeyCount(): Promise<number> {
+    const result = await this.pool.query(
+      "SELECT COUNT(*)::integer AS count FROM api_keys WHERE revoked_at IS NULL AND 'admin'=ANY(scopes)",
+    );
+    return Number(result.rows[0].count);
+  }
+
+  async consumeRateLimit(subject: string, limit: number, now: Date): Promise<boolean> {
+    const windowStart = new Date(Math.floor(now.getTime() / 60_000) * 60_000).toISOString();
+    const result = await this.pool.query(
+      `INSERT INTO rate_limit_windows (subject,window_start,request_count)
+       VALUES ($1,$2,1)
+       ON CONFLICT (subject,window_start)
+       DO UPDATE SET request_count=rate_limit_windows.request_count+1
+       RETURNING request_count`,
+      [subject, windowStart],
+    );
+    return Number(result.rows[0].request_count) <= limit;
+  }
+
+  private rowToUser(row: Record<string, any>): IdentityUser {
+    return {
+      id: row.id,
+      email: row.email,
+      displayName: row.display_name,
+      createdAt: new Date(row.created_at).toISOString(),
+    };
+  }
+
+  async createUser(user: IdentityUser): Promise<IdentityUser> {
+    const result = await this.pool.query(
+      "INSERT INTO identity_users (id,email,display_name,created_at) VALUES ($1,$2,$3,$4) RETURNING *",
+      [user.id, user.email, user.displayName, user.createdAt],
+    );
+    return this.rowToUser(result.rows[0]);
+  }
+
+  async findUserByEmail(email: string): Promise<IdentityUser | null> {
+    const result = await this.pool.query("SELECT * FROM identity_users WHERE email=$1", [email]);
+    return result.rowCount ? this.rowToUser(result.rows[0]) : null;
+  }
+
+  async findUserById(id: string): Promise<IdentityUser | null> {
+    const result = await this.pool.query("SELECT * FROM identity_users WHERE id=$1", [id]);
+    return result.rowCount ? this.rowToUser(result.rows[0]) : null;
+  }
+
+  async userCount(): Promise<number> {
+    const result = await this.pool.query("SELECT COUNT(*)::integer AS count FROM identity_users");
+    return Number(result.rows[0].count);
+  }
+
+  private rowToPasskey(row: Record<string, any>): StoredPasskey {
+    return {
+      id: row.id,
+      userId: row.user_id,
+      credentialId: row.credential_id,
+      publicKeyBase64: row.public_key_base64,
+      counter: Number(row.counter),
+      transports: row.transports,
+      deviceType: row.device_type,
+      backedUp: row.backed_up,
+      createdAt: new Date(row.created_at).toISOString(),
+    };
+  }
+
+  async createPasskey(passkey: StoredPasskey): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO passkeys (
+        id,user_id,credential_id,public_key_base64,counter,transports,
+        device_type,backed_up,created_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [
+        passkey.id,
+        passkey.userId,
+        passkey.credentialId,
+        passkey.publicKeyBase64,
+        passkey.counter,
+        passkey.transports,
+        passkey.deviceType,
+        passkey.backedUp,
+        passkey.createdAt,
+      ],
+    );
+  }
+
+  async passkeysForUser(userId: string): Promise<StoredPasskey[]> {
+    const result = await this.pool.query("SELECT * FROM passkeys WHERE user_id=$1", [userId]);
+    return result.rows.map((row) => this.rowToPasskey(row));
+  }
+
+  async findPasskey(credentialId: string): Promise<StoredPasskey | null> {
+    const result = await this.pool.query("SELECT * FROM passkeys WHERE credential_id=$1", [
+      credentialId,
+    ]);
+    return result.rowCount ? this.rowToPasskey(result.rows[0]) : null;
+  }
+
+  async updatePasskeyCounter(id: string, counter: number): Promise<void> {
+    await this.pool.query("UPDATE passkeys SET counter=$2 WHERE id=$1", [id, counter]);
+  }
+
+  async createChallenge(challenge: AuthChallenge): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO auth_challenges (id,user_id,purpose,challenge,expires_at,used_at)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [
+        challenge.id,
+        challenge.userId,
+        challenge.purpose,
+        challenge.challenge,
+        challenge.expiresAt,
+        challenge.usedAt,
+      ],
+    );
+  }
+
+  async consumeChallenge(id: string): Promise<AuthChallenge | null> {
+    const result = await this.pool.query(
+      `UPDATE auth_challenges SET used_at=NOW()
+       WHERE id=$1 AND used_at IS NULL AND expires_at>NOW() RETURNING *`,
+      [id],
+    );
+    if (!result.rowCount) {
+      return null;
+    }
+    const row = result.rows[0];
+    return {
+      id: row.id,
+      userId: row.user_id,
+      purpose: row.purpose,
+      challenge: row.challenge,
+      expiresAt: new Date(row.expires_at).toISOString(),
+      usedAt: null,
+    };
+  }
+
+  async createSession(session: AuthSession): Promise<void> {
+    await this.pool.query(
+      "INSERT INTO auth_sessions (id,user_id,digest,expires_at,created_at) VALUES ($1,$2,$3,$4,$5)",
+      [session.id, session.userId, session.digest, session.expiresAt, session.createdAt],
+    );
+  }
+
+  async findSessionByDigest(digest: string): Promise<AuthSession | null> {
+    const result = await this.pool.query(
+      "SELECT * FROM auth_sessions WHERE digest=$1 AND expires_at>NOW()",
+      [digest],
+    );
+    if (!result.rowCount) {
+      return null;
+    }
+    const row = result.rows[0];
+    return {
+      id: row.id,
+      userId: row.user_id,
+      digest: row.digest,
+      expiresAt: new Date(row.expires_at).toISOString(),
+      createdAt: new Date(row.created_at).toISOString(),
+    };
+  }
+
+  async deleteSessionByDigest(digest: string): Promise<boolean> {
+    const result = await this.pool.query("DELETE FROM auth_sessions WHERE digest=$1", [digest]);
+    return (result.rowCount ?? 0) > 0;
+  }
+
+  async createRecoveryCodes(records: RecoveryCodeRecord[]): Promise<void> {
+    for (const record of records) {
+      await this.pool.query(
+        "INSERT INTO recovery_codes (id,user_id,digest,created_at,used_at) VALUES ($1,$2,$3,$4,$5)",
+        [record.id, record.userId, record.digest, record.createdAt, record.usedAt],
+      );
+    }
+  }
+
+  async consumeRecoveryCode(userId: string, digest: string): Promise<boolean> {
+    const result = await this.pool.query(
+      `UPDATE recovery_codes SET used_at=NOW()
+       WHERE user_id=$1 AND digest=$2 AND used_at IS NULL`,
+      [userId, digest],
+    );
+    return (result.rowCount ?? 0) > 0;
+  }
+
+  async appendAudit(event: AuditEvent): Promise<void> {
+    await this.pool.query(
+      `INSERT INTO audit_events (
+        id,actor_id,action,resource_type,resource_id,metadata,created_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [
+        event.id,
+        event.actorId,
+        event.action,
+        event.resourceType,
+        event.resourceId,
+        event.metadata,
+        event.createdAt,
+      ],
+    );
+  }
+
+  async listAudit(limit = 100): Promise<AuditEvent[]> {
+    const result = await this.pool.query(
+      "SELECT * FROM audit_events ORDER BY created_at DESC LIMIT $1",
+      [Math.min(limit, 500)],
+    );
+    return result.rows.map((row) => ({
+      id: row.id,
+      actorId: row.actor_id,
+      action: row.action,
+      resourceType: row.resource_type,
+      resourceId: row.resource_id,
+      metadata: row.metadata,
+      createdAt: new Date(row.created_at).toISOString(),
+    }));
+  }
+
+  async listDeletionReceipts(limit = 100): Promise<DeletionReceipt[]> {
+    const result = await this.pool.query(
+      "SELECT * FROM deletion_receipts ORDER BY payload_deleted_at DESC LIMIT $1",
+      [Math.min(limit, 500)],
+    );
+    return result.rows.map((row) => ({
+      id: row.id,
+      jobId: row.job_id,
+      payloadDeletedAt: new Date(row.payload_deleted_at).toISOString(),
+      metadataDeleteAfter: new Date(row.metadata_delete_after).toISOString(),
+    }));
+  }
+
+  async deleteExpiredPayloads(now: Date): Promise<number> {
+    const result = await this.pool.query(
+      "SELECT id, task, created_at FROM jobs WHERE expires_at <= $1",
+      [now.toISOString()],
+    );
+    let deleted = 0;
+    for (const row of result.rows) {
+      const task = this.decrypt<Job["task"]>(row.task, `job:${row.id}:task:v2`);
+      if (task.objective === "[deleted]") {
+        continue;
+      }
+      const tombstone = {
+        ...task,
+        objective: "[deleted]",
+        requiredContext: [],
+        constraints: [],
+      };
+      await this.pool.query("UPDATE jobs SET task=$2, output=NULL, updated_at=NOW() WHERE id=$1", [
+        row.id,
+        this.encrypt(tombstone, `job:${row.id}:task:v2`),
+      ]);
+      await this.pool.query("DELETE FROM job_events WHERE job_id=$1", [row.id]);
+      await this.pool.query(
+        `INSERT INTO deletion_receipts (
+          id,job_id,payload_deleted_at,metadata_delete_after
+        ) VALUES ($1,$2,$3,$4) ON CONFLICT (job_id) DO NOTHING`,
+        [
+          randomUUID(),
+          row.id,
+          now.toISOString(),
+          new Date(new Date(row.created_at).getTime() + 90 * 86_400_000).toISOString(),
+        ],
+      );
+      deleted += 1;
+    }
+    return deleted;
+  }
+
+  async deleteExpiredMetadata(now: Date): Promise<number> {
+    const cutoff = new Date(now.getTime() - 90 * 86_400_000).toISOString();
+    const result = await this.pool.query("DELETE FROM jobs WHERE created_at <= $1", [cutoff]);
+    await this.pool.query("DELETE FROM audit_events WHERE created_at <= $1", [cutoff]);
+    return result.rowCount ?? 0;
+  }
+}

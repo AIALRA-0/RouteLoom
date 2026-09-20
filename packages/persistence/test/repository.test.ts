@@ -1,0 +1,900 @@
+import { randomUUID } from "node:crypto";
+
+import { describe, expect, it, vi } from "vitest";
+
+import {
+  ChatGptWebQualificationRunSchema,
+  TaskContractSchema,
+  type Job,
+  type SessionThread,
+} from "@aialra/contracts";
+
+import {
+  configuredChatGptWebAccountConfigs,
+  DATABASE_MIGRATION_SQL,
+  equalChatGptWebRoutingWeights,
+  InMemoryJobRepository,
+  PostgresJobRepository,
+  reconstructHistoricalJobEventData,
+  selectWeightedChatGptWebAccount,
+} from "../src/index.js";
+
+function jobFixture(): Job {
+  const now = new Date();
+  return {
+    id: randomUUID(),
+    status: "accepted" as const,
+    requestHash: "hash",
+    idempotencyKey: "key",
+    callerId: "caller",
+    task: TaskContractSchema.parse({ objective: "Run a test" }),
+    route: null,
+    output: null,
+    errorCode: null,
+    errorMessage: null,
+    usage: {
+      inputTokens: 0,
+      cachedInputTokens: 0,
+      outputTokens: 0,
+      codexCredits: null,
+      apiEquivalentUsd: null,
+      quotaUsedPercentBefore: null,
+      quotaUsedPercentAfter: null,
+      quotaWindowDeltaPercent: null,
+      allocatedSubscriptionUsd: null,
+    },
+    validation: null,
+    createdAt: now.toISOString(),
+    updatedAt: now.toISOString(),
+    expiresAt: new Date(now.getTime() + 86_400_000).toISOString(),
+  };
+}
+
+function sessionThreadFixture(overrides: Partial<SessionThread> = {}): SessionThread {
+  const now = Date.now();
+  return {
+    sessionKey: "session-1",
+    callerId: "caller",
+    model: "gpt-5.6-luna",
+    effort: "medium",
+    turnCount: 1,
+    createdAt: new Date(now).toISOString(),
+    lastUsedAt: new Date(now).toISOString(),
+    expiresAt: new Date(now + 86_400_000).toISOString(),
+    ...overrides,
+  };
+}
+
+describe("InMemoryJobRepository", () => {
+  it("loads call attribution events for a job list in one batch", async () => {
+    const repository = new InMemoryJobRepository();
+    const first = jobFixture();
+    const second = { ...jobFixture(), id: randomUUID() };
+    await repository.create(first);
+    await repository.create(second);
+    await repository.appendEvent(first.id, "tool", {
+      kind: "chatgpt_web_account_assigned",
+      accountId: "account-a",
+    });
+    const events = await repository.eventsForJobs([first.id, second.id]);
+    expect(events.get(first.id)?.[0]?.data).toMatchObject({ accountId: "account-a" });
+    expect(events.get(second.id)).toEqual([]);
+  });
+
+  it("creates exact equal weights and rejects a total other than 100", async () => {
+    expect(equalChatGptWebRoutingWeights(["account-a", "account-b", "account-c"])).toEqual({
+      "account-a": 34,
+      "account-b": 33,
+      "account-c": 33,
+    });
+    const repository = new InMemoryJobRepository();
+    await repository.syncChatGptWebAccounts(configuredChatGptWebAccountConfigs("a,b"));
+    await expect(
+      repository.updateChatGptWebRoutingWeights({ "account-a": 70, "account-b": 20 }),
+    ).rejects.toThrow("chatgpt_web_routing_weight_total_invalid");
+    await expect(
+      repository.updateChatGptWebRoutingWeights({ "account-a": 80, "account-b": 20 }),
+    ).resolves.toMatchObject([{ routingWeight: 80 }, { routingWeight: 20 }]);
+  });
+
+  it("uses deterministic weighted routing and never selects a zero-weight account", async () => {
+    const repository = new InMemoryJobRepository();
+    await repository.syncChatGptWebAccounts(configuredChatGptWebAccountConfigs("a,b"));
+    await repository.updateChatGptWebRoutingWeights({ "account-a": 80, "account-b": 20 });
+    const accounts = await repository.listChatGptWebAccounts();
+    const selections = Array.from(
+      { length: 2_000 },
+      (_, index) => selectWeightedChatGptWebAccount(`job-${index}`, accounts)?.accountId,
+    );
+    const aShare = selections.filter((accountId) => accountId === "account-a").length / 2_000;
+    expect(aShare).toBeGreaterThan(0.76);
+    expect(aShare).toBeLessThan(0.84);
+    await repository.updateChatGptWebRoutingWeights({ "account-a": 100, "account-b": 0 });
+    const zeroWeight = await repository.listChatGptWebAccounts();
+    expect(
+      Array.from(
+        { length: 100 },
+        (_, index) => selectWeightedChatGptWebAccount(`zero-${index}`, zeroWeight)?.accountId,
+      ),
+    ).toEqual(Array(100).fill("account-a"));
+  });
+  it("keeps account plans manual and leases each account at most once", async () => {
+    const repository = new InMemoryJobRepository();
+    const configs = configuredChatGptWebAccountConfigs("a,b");
+    await repository.syncChatGptWebAccounts(configs);
+    for (const accountId of ["account-a", "account-b"]) {
+      await repository.updateChatGptWebAccount(accountId, {
+        enabled: true,
+        qualified: true,
+        state: "ready",
+        authenticated: true,
+        extensionConnected: true,
+        pageReady: true,
+        sandboxVerified: true,
+      });
+    }
+
+    const now = new Date("2026-09-01T12:00:00.000Z");
+    const leases = await Promise.all([
+      repository.acquireChatGptWebAccountLease(
+        "00000000-0000-4000-8000-000000000001",
+        ["account-a", "account-b"],
+        now,
+        900_000,
+      ),
+      repository.acquireChatGptWebAccountLease(
+        "00000000-0000-4000-8000-000000000002",
+        ["account-a", "account-b"],
+        now,
+        900_000,
+      ),
+    ]);
+
+    expect(leases.map((lease) => lease?.accountId).sort()).toEqual(["account-a", "account-b"]);
+    expect(
+      await repository.acquireChatGptWebAccountLease(
+        "00000000-0000-4000-8000-000000000003",
+        ["account-a", "account-b"],
+        now,
+        900_000,
+      ),
+    ).toBeNull();
+    expect(
+      (await repository.listChatGptWebAccounts()).every((account) => account.plan === "unknown"),
+    ).toBe(true);
+  });
+
+  it("does not use Codex subscription quota to block a web chat lease", async () => {
+    const repository = new InMemoryJobRepository();
+    const [config] = configuredChatGptWebAccountConfigs("a");
+    await repository.syncChatGptWebAccounts([config!]);
+    await repository.updateChatGptWebAccount("account-a", {
+      enabled: true,
+      qualified: true,
+      state: "ready",
+      authenticated: true,
+      extensionConnected: true,
+      pageReady: true,
+      sandboxVerified: true,
+      quota: {
+        status: "fresh",
+        source: "chatgpt-usage",
+        fetchedAt: "2026-09-14T12:00:00.000Z",
+        windows: [
+          {
+            kind: "primary",
+            usedPercent: 100,
+            remainingPercent: 0,
+            windowDurationMinutes: 10_080,
+            resetsAt: "2026-09-19T12:00:00.000Z",
+          },
+        ],
+        errorCode: null,
+      },
+    });
+
+    await expect(
+      repository.acquireChatGptWebAccountLease(
+        "00000000-0000-4000-8000-000000000099",
+        ["account-a"],
+        new Date("2026-09-14T12:00:00.000Z"),
+        900_000,
+      ),
+    ).resolves.toMatchObject({ accountId: "account-a" });
+  });
+
+  it("quarantines an expired lease instead of reusing it", async () => {
+    const repository = new InMemoryJobRepository();
+    const [config] = configuredChatGptWebAccountConfigs("a");
+    await repository.syncChatGptWebAccounts([config!]);
+    await repository.updateChatGptWebAccount("account-a", {
+      enabled: true,
+      qualified: true,
+      state: "ready",
+      authenticated: true,
+      extensionConnected: true,
+      pageReady: true,
+      sandboxVerified: true,
+    });
+    const lease = await repository.acquireChatGptWebAccountLease(
+      "00000000-0000-4000-8000-000000000004",
+      ["account-a"],
+      new Date("2026-09-01T12:00:00.000Z"),
+      900_000,
+    );
+    expect(lease?.accountId).toBe("account-a");
+
+    const expired = await repository.acquireChatGptWebAccountLease(
+      "00000000-0000-4000-8000-000000000005",
+      ["account-a"],
+      new Date("2026-09-01T12:16:00.000Z"),
+      900_000,
+    );
+    expect(expired).toBeNull();
+    expect(await repository.findChatGptWebAccount("account-a")).toMatchObject({
+      state: "quarantined",
+      qualified: false,
+      lastFailureCode: "chatgpt_lease_expired",
+    });
+  });
+
+  it("renews a lease only while the same job still owns an unexpired account", async () => {
+    const repository = new InMemoryJobRepository();
+    const [config] = configuredChatGptWebAccountConfigs("a");
+    await repository.syncChatGptWebAccounts([config!]);
+    await repository.updateChatGptWebAccount("account-a", {
+      enabled: true,
+      qualified: true,
+      state: "ready",
+      authenticated: true,
+      extensionConnected: true,
+      pageReady: true,
+      sandboxVerified: true,
+    });
+    const jobId = "00000000-0000-4000-8000-000000000006";
+    const lease = await repository.acquireChatGptWebAccountLease(
+      jobId,
+      ["account-a"],
+      new Date("2026-09-01T12:00:00.000Z"),
+      60_000,
+    );
+
+    await expect(
+      repository.renewChatGptWebAccountLease(
+        "account-a",
+        jobId,
+        lease!.leaseEpoch,
+        new Date("2026-09-01T12:00:30.000Z"),
+        60_000,
+      ),
+    ).resolves.toBe(true);
+    expect((await repository.findChatGptWebAccount("account-a"))?.leaseExpiresAt).toBe(
+      "2026-09-01T12:01:30.000Z",
+    );
+    await expect(
+      repository.renewChatGptWebAccountLease(
+        "account-a",
+        "00000000-0000-4000-8000-000000000007",
+        lease!.leaseEpoch,
+        new Date("2026-09-01T12:00:40.000Z"),
+        60_000,
+      ),
+    ).resolves.toBe(false);
+  });
+
+  it("preserves an active lease while account health is refreshed", async () => {
+    const repository = new InMemoryJobRepository();
+    const [config] = configuredChatGptWebAccountConfigs("a");
+    await repository.syncChatGptWebAccounts([config!]);
+    await repository.updateChatGptWebAccount("account-a", {
+      enabled: true,
+      qualified: true,
+      state: "ready",
+      authenticated: true,
+      extensionConnected: true,
+      pageReady: true,
+      sandboxVerified: true,
+    });
+    const jobId = "00000000-0000-4000-8000-000000000008";
+    const lease = await repository.acquireChatGptWebAccountLease(
+      jobId,
+      ["account-a"],
+      new Date("2026-09-01T12:00:00.000Z"),
+      60_000,
+    );
+
+    await repository.updateChatGptWebAccount("account-a", {
+      lastHeartbeatAt: "2026-09-01T12:00:10.000Z",
+      pageReady: true,
+      authenticated: true,
+    });
+
+    expect(await repository.findChatGptWebAccount("account-a")).toMatchObject({
+      activeJobId: jobId,
+      state: "busy",
+    });
+    await expect(
+      repository.renewChatGptWebAccountLease(
+        "account-a",
+        jobId,
+        lease!.leaseEpoch,
+        new Date("2026-09-01T12:00:20.000Z"),
+        60_000,
+      ),
+    ).resolves.toBe(true);
+  });
+
+  it("rejects stale renew and release after a newer lease epoch exists", async () => {
+    const repository = new InMemoryJobRepository();
+    const [config] = configuredChatGptWebAccountConfigs("a");
+    await repository.syncChatGptWebAccounts([config!]);
+    await repository.updateChatGptWebAccount("account-a", {
+      enabled: true,
+      qualified: true,
+      state: "ready",
+    });
+    const firstJob = "00000000-0000-4000-8000-000000000021";
+    const first = await repository.acquireChatGptWebAccountLease(
+      firstJob,
+      ["account-a"],
+      new Date("2026-09-01T12:00:00.000Z"),
+      60_000,
+    );
+    await repository.releaseChatGptWebAccountLease("account-a", firstJob, first!.leaseEpoch, {
+      state: "ready",
+    });
+    const secondJob = "00000000-0000-4000-8000-000000000022";
+    const second = await repository.acquireChatGptWebAccountLease(
+      secondJob,
+      ["account-a"],
+      new Date("2026-09-01T12:00:10.000Z"),
+      60_000,
+    );
+
+    await expect(
+      repository.renewChatGptWebAccountLease(
+        "account-a",
+        firstJob,
+        first!.leaseEpoch,
+        new Date("2026-09-01T12:00:20.000Z"),
+        60_000,
+      ),
+    ).resolves.toBe(false);
+    await expect(
+      repository.releaseChatGptWebAccountLease("account-a", firstJob, first!.leaseEpoch),
+    ).resolves.toBeNull();
+    expect(await repository.findChatGptWebAccount("account-a")).toMatchObject({
+      activeJobId: secondJob,
+      leaseEpoch: second!.leaseEpoch,
+    });
+  });
+
+  it("preserves idempotency lookup", async () => {
+    const repository = new InMemoryJobRepository();
+    await repository.create(jobFixture());
+
+    expect(await repository.findByIdempotency("caller", "key")).not.toBeNull();
+  });
+
+  it("rolls back the initial job when transactional enqueue fails", async () => {
+    const repository = new InMemoryJobRepository();
+    const job = jobFixture();
+    const audit = {
+      id: randomUUID(),
+      actorId: "caller",
+      action: "job.created",
+      resourceType: "job",
+      resourceId: job.id,
+      metadata: {},
+      createdAt: job.createdAt,
+    };
+    await expect(
+      repository.createInitialJob(job, audit, {
+        status: "queued",
+        audit: { ...audit, id: randomUUID(), action: "job.queued" },
+        enqueue: async () => {
+          throw new Error("queue_unavailable");
+        },
+      }),
+    ).rejects.toThrow("queue_unavailable");
+    expect(await repository.findById(job.id)).toBeNull();
+    expect(await repository.events(job.id)).toEqual([]);
+    expect(await repository.listAudit()).toEqual([]);
+  });
+
+  it("allows only one worker to claim a queued job", async () => {
+    const repository = new InMemoryJobRepository();
+    const job = jobFixture();
+    const audit = {
+      id: randomUUID(),
+      actorId: "caller",
+      action: "job.created",
+      resourceType: "job",
+      resourceId: job.id,
+      metadata: {},
+      createdAt: job.createdAt,
+    };
+    await repository.createInitialJob(job, audit, {
+      status: "queued",
+      audit: { ...audit, id: randomUUID(), action: "job.queued" },
+    });
+    const claims = await Promise.all(
+      Array.from({ length: 16 }, (_, index) =>
+        repository.claimJobForExecution(job.id, {
+          ...audit,
+          id: randomUUID(),
+          actorId: `worker-${index}`,
+          action: "worker.running",
+        }),
+      ),
+    );
+    expect(claims.filter(Boolean)).toHaveLength(1);
+    expect((await repository.findById(job.id))?.status).toBe("running");
+  });
+
+  it("persists one submit intent and rejects replay after browser acceptance", async () => {
+    const repository = new InMemoryJobRepository();
+    const [config] = configuredChatGptWebAccountConfigs("a");
+    await repository.syncChatGptWebAccounts([config!]);
+    await repository.updateChatGptWebAccount("account-a", {
+      enabled: true,
+      qualified: true,
+      state: "ready",
+    });
+    const job = jobFixture();
+    await repository.create(job);
+    const lease = await repository.acquireChatGptWebAccountLease(
+      job.id,
+      ["account-a"],
+      new Date(),
+      60_000,
+    );
+    const intent = {
+      intentId: randomUUID(),
+      jobId: job.id,
+      accountId: "account-a",
+      leaseEpoch: lease!.leaseEpoch,
+      state: "prepared" as const,
+      phaseSequence: 0,
+      deadlineAt: new Date(Date.now() + 60_000).toISOString(),
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    await expect(repository.createChatGptWebSubmitIntent(intent)).resolves.toMatchObject(intent);
+    await expect(
+      repository.createChatGptWebSubmitIntent({ ...intent, intentId: randomUUID() }),
+    ).rejects.toThrow("chatgpt_submission_already_started");
+    await expect(
+      repository.advanceChatGptWebSubmitIntent(
+        intent.intentId,
+        intent.leaseEpoch,
+        "command_accepted",
+        1,
+      ),
+    ).resolves.toBe(true);
+    await expect(
+      repository.advanceChatGptWebSubmitIntent(
+        intent.intentId,
+        intent.leaseEpoch,
+        "action_started",
+        1,
+      ),
+    ).resolves.toBe(false);
+    await expect(
+      repository.advanceChatGptWebSubmitIntent(intent.intentId, intent.leaseEpoch, "completed", 2),
+    ).resolves.toBe(true);
+    await expect(
+      repository.advanceChatGptWebSubmitIntent(intent.intentId, intent.leaseEpoch, "failed", 3),
+    ).resolves.toBe(false);
+    await expect(
+      repository.createChatGptWebSubmitIntent({ ...intent, intentId: randomUUID() }),
+    ).rejects.toThrow("chatgpt_submission_already_started");
+  });
+
+  it("keeps either submit-intent terminal state immutable under later updates", async () => {
+    const repository = new InMemoryJobRepository();
+    const [config] = configuredChatGptWebAccountConfigs("a");
+    await repository.syncChatGptWebAccounts([config!]);
+    await repository.updateChatGptWebAccount("account-a", {
+      enabled: true,
+      qualified: true,
+      state: "ready",
+    });
+    const job = jobFixture();
+    await repository.create(job);
+    const lease = await repository.acquireChatGptWebAccountLease(
+      job.id,
+      ["account-a"],
+      new Date(),
+      60_000,
+    );
+    const intent = {
+      intentId: randomUUID(),
+      jobId: job.id,
+      accountId: "account-a",
+      leaseEpoch: lease!.leaseEpoch,
+      state: "prepared" as const,
+      phaseSequence: 0,
+      deadlineAt: new Date(Date.now() + 60_000).toISOString(),
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    await repository.createChatGptWebSubmitIntent(intent);
+
+    const updates = await Promise.all([
+      repository.advanceChatGptWebSubmitIntent(intent.intentId, intent.leaseEpoch, "failed", 1),
+      repository.advanceChatGptWebSubmitIntent(intent.intentId, intent.leaseEpoch, "completed", 2),
+    ]);
+    expect(updates.filter(Boolean)).toHaveLength(1);
+    await expect(
+      repository.advanceChatGptWebSubmitIntent(intent.intentId, intent.leaseEpoch, "completed", 3),
+    ).resolves.toBe(false);
+  });
+
+  it("rejects submit-intent progress after its account lease expires", async () => {
+    vi.useFakeTimers();
+    const now = new Date("2026-09-20T00:00:00.000Z");
+    vi.setSystemTime(now);
+    try {
+      const repository = new InMemoryJobRepository();
+      const [config] = configuredChatGptWebAccountConfigs("a");
+      await repository.syncChatGptWebAccounts([config!]);
+      await repository.updateChatGptWebAccount("account-a", {
+        enabled: true,
+        qualified: true,
+        state: "ready",
+      });
+      const job = jobFixture();
+      await repository.create(job);
+      const lease = await repository.acquireChatGptWebAccountLease(
+        job.id,
+        ["account-a"],
+        now,
+        60_000,
+      );
+      const intent = {
+        intentId: randomUUID(),
+        jobId: job.id,
+        accountId: "account-a",
+        leaseEpoch: lease!.leaseEpoch,
+        state: "prepared" as const,
+        phaseSequence: 0,
+        deadlineAt: new Date(now.getTime() + 120_000).toISOString(),
+        createdAt: now.toISOString(),
+        updatedAt: now.toISOString(),
+      };
+      await repository.createChatGptWebSubmitIntent(intent);
+      vi.setSystemTime(new Date(now.getTime() + 60_001));
+
+      await expect(
+        repository.advanceChatGptWebSubmitIntent(intent.intentId, intent.leaseEpoch, "failed", 1),
+      ).resolves.toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("sequences events", async () => {
+    const repository = new InMemoryJobRepository();
+    const job = await repository.create(jobFixture());
+    await repository.appendEvent(job.id, "status", { status: "queued" });
+    await repository.appendEvent(job.id, "status", { status: "running" });
+
+    expect((await repository.events(job.id)).map((event) => event.sequence)).toEqual([0, 1]);
+  });
+
+  it("reconstructs only status evidence and marks missing history", () => {
+    const recovered = reconstructHistoricalJobEventData("succeeded", "2026-09-01T12:00:00.000Z", [
+      { action: "job.created", createdAt: "2026-09-01T11:58:00.000Z" },
+      { action: "job.queued", createdAt: "2026-09-01T11:59:00.000Z" },
+      { action: "legacy.unknown", createdAt: "2026-09-01T11:59:30.000Z" },
+    ]);
+
+    expect(recovered.events.map((event) => event.status)).toEqual([
+      "accepted",
+      "queued",
+      "succeeded",
+    ]);
+    expect(recovered.auditDerivedEvents).toBe(2);
+    expect(recovered.currentStatusEvents).toBe(1);
+    expect(recovered.ignoredAuditActions).toBe(1);
+    expect(recovered.hasUnresolvedHistory).toBe(true);
+    expect(recovered.events.every((event) => event.data.historicalRecovery === true)).toBe(true);
+  });
+
+  it("records a status transition and its audit together", async () => {
+    const repository = new InMemoryJobRepository();
+    const job = await repository.create(jobFixture());
+    const createdAt = new Date().toISOString();
+
+    await repository.transitionJob(
+      job.id,
+      { status: "queued" },
+      {
+        id: randomUUID(),
+        actorId: "caller",
+        action: "job.queued",
+        resourceType: "job",
+        resourceId: job.id,
+        metadata: {},
+        createdAt,
+      },
+    );
+
+    expect((await repository.findById(job.id))?.status).toBe("queued");
+    expect(await repository.events(job.id)).toMatchObject([{ data: { status: "queued" } }]);
+    expect(await repository.listAudit()).toMatchObject([{ action: "job.queued" }]);
+  });
+
+  it("creates a deletion receipt when an expired payload is removed", async () => {
+    const repository = new InMemoryJobRepository();
+    const job = jobFixture();
+    job.output = { private: "payload" };
+    job.expiresAt = new Date(Date.now() - 1_000).toISOString();
+    await repository.create(job);
+    await repository.appendEvent(job.id, "output.delta", { delta: "private event" });
+
+    expect(await repository.deleteExpiredPayloads(new Date())).toBe(1);
+    expect((await repository.findById(job.id))?.task.objective).toBe("[deleted]");
+    expect(await repository.events(job.id)).toHaveLength(0);
+    expect(await repository.listDeletionReceipts()).toHaveLength(1);
+  });
+
+  it("removes job metadata after ninety days", async () => {
+    const repository = new InMemoryJobRepository();
+    const job = jobFixture();
+    job.createdAt = new Date(Date.now() - 91 * 86_400_000).toISOString();
+    await repository.create(job);
+
+    expect(await repository.deleteExpiredMetadata(new Date())).toBe(1);
+    expect(await repository.findById(job.id)).toBeNull();
+  });
+
+  it("creates an API key once for the same idempotency request", async () => {
+    const repository = new InMemoryJobRepository();
+    const now = new Date().toISOString();
+    const record = {
+      id: randomUUID(),
+      createdBy: "actor",
+      name: "Synthetic key",
+      prefix: "amr_000000000000",
+      digest: "synthetic-digest",
+      scopes: ["jobs:read"],
+      executionChannels: ["codex" as const],
+      executionPolicy: {
+        defaultPreset: "restricted" as const,
+        allowedPresets: ["restricted" as const],
+      },
+      rateLimitPerMinute: 60,
+      expiresAt: null,
+      revokedAt: null,
+      createdAt: now,
+      lastUsedAt: null,
+    };
+    const first = await repository.createApiKeyIdempotent(
+      "actor",
+      "request-key",
+      "request-hash",
+      record,
+      "synthetic-plaintext",
+    );
+    const second = await repository.createApiKeyIdempotent(
+      "actor",
+      "request-key",
+      "request-hash",
+      { ...record, id: randomUUID() },
+      "different-plaintext",
+    );
+
+    expect(first.replayed).toBe(false);
+    expect(second.replayed).toBe(true);
+    expect(second.record.id).toBe(record.id);
+    expect(await repository.apiKeyCount()).toBe(1);
+  });
+
+  it("inserts then replaces a session thread on upsert", async () => {
+    const repository = new InMemoryJobRepository();
+    const thread = sessionThreadFixture({ sessionKey: "session-1" });
+
+    const inserted = await repository.upsertSessionThread(thread);
+    expect(inserted.turnCount).toBe(1);
+
+    const replaced = await repository.upsertSessionThread({
+      ...thread,
+      turnCount: thread.turnCount + 1,
+      lastUsedAt: new Date(Date.now() + 1_000).toISOString(),
+    });
+    expect(replaced.turnCount).toBe(2);
+    expect((await repository.findSessionThread("session-1"))?.turnCount).toBe(2);
+  });
+
+  it("finds a session thread by key and returns null for a miss", async () => {
+    const repository = new InMemoryJobRepository();
+    await repository.upsertSessionThread(sessionThreadFixture({ sessionKey: "session-1" }));
+
+    expect(await repository.findSessionThread("session-1")).toMatchObject({
+      sessionKey: "session-1",
+      callerId: "caller",
+    });
+    expect(await repository.findSessionThread("missing")).toBeNull();
+  });
+
+  it("lists session threads for the caller, all for admins, ordered by last use", async () => {
+    const repository = new InMemoryJobRepository();
+    const now = Date.now();
+    await repository.upsertSessionThread(
+      sessionThreadFixture({
+        sessionKey: "mine-old",
+        callerId: "caller",
+        lastUsedAt: new Date(now - 2_000).toISOString(),
+      }),
+    );
+    await repository.upsertSessionThread(
+      sessionThreadFixture({
+        sessionKey: "other",
+        callerId: "other-caller",
+        lastUsedAt: new Date(now - 1_000).toISOString(),
+      }),
+    );
+    await repository.upsertSessionThread(
+      sessionThreadFixture({
+        sessionKey: "mine-new",
+        callerId: "caller",
+        lastUsedAt: new Date(now).toISOString(),
+      }),
+    );
+
+    const mine = await repository.listSessionThreads("caller", false);
+    expect(mine.map((thread) => thread.sessionKey)).toEqual(["mine-new", "mine-old"]);
+
+    const all = await repository.listSessionThreads("caller", true);
+    expect(all.map((thread) => thread.sessionKey)).toEqual(["mine-new", "other", "mine-old"]);
+
+    const limited = await repository.listSessionThreads("caller", true, 2);
+    expect(limited).toHaveLength(2);
+  });
+
+  it("deletes only expired session threads and returns the count", async () => {
+    const repository = new InMemoryJobRepository();
+    const now = Date.now();
+    await repository.upsertSessionThread(
+      sessionThreadFixture({
+        sessionKey: "expired",
+        expiresAt: new Date(now - 1_000).toISOString(),
+      }),
+    );
+    await repository.upsertSessionThread(
+      sessionThreadFixture({
+        sessionKey: "active",
+        expiresAt: new Date(now + 86_400_000).toISOString(),
+      }),
+    );
+
+    expect(await repository.deleteExpiredSessionThreads(new Date(now))).toBe(1);
+    expect(await repository.findSessionThread("expired")).toBeNull();
+    expect(await repository.findSessionThread("active")).not.toBeNull();
+    expect(await repository.deleteExpiredSessionThreads(new Date(now))).toBe(0);
+  });
+
+  it("persists only the secret-free ChatGPT web qualification record", async () => {
+    const repository = new InMemoryJobRepository();
+    const now = new Date().toISOString();
+    const run = ChatGptWebQualificationRunSchema.parse({
+      id: randomUUID(),
+      suite: "chat_3",
+      status: "accepted",
+      total: 3,
+      completed: 0,
+      succeeded: 0,
+      failed: 0,
+      items: [],
+      errorCode: null,
+      createdBy: "admin",
+      createdAt: now,
+      startedAt: null,
+      completedAt: null,
+      updatedAt: now,
+    });
+
+    await repository.createChatGptWebQualificationRun(run);
+    const updated = await repository.updateChatGptWebQualificationRun(run.id, {
+      status: "running",
+      startedAt: now,
+    });
+
+    expect(updated.status).toBe("running");
+    expect(await repository.findChatGptWebQualificationRun(run.id)).toMatchObject({
+      id: run.id,
+      suite: "chat_3",
+    });
+    expect(await repository.listChatGptWebQualificationRuns()).toHaveLength(1);
+  });
+});
+
+describe("PostgresJobRepository", () => {
+  it("returns the committed job when a concurrent insert loses the idempotency race", async () => {
+    const repository = new PostgresJobRepository(
+      "postgresql://unused:unused@127.0.0.1:1/unused",
+      Buffer.alloc(32).toString("base64"),
+    );
+    const existing = jobFixture();
+    const incoming = { ...existing, id: randomUUID() };
+    const queries: string[] = [];
+    Object.defineProperty(repository, "pool", {
+      value: {
+        query: async (sql: string) => {
+          queries.push(sql);
+          return { rowCount: 0, rows: [] };
+        },
+      },
+    });
+    const lookup = vi.spyOn(repository, "findByIdempotency").mockResolvedValue(existing);
+
+    await expect(repository.create(incoming)).resolves.toEqual(existing);
+    expect(queries[0]).toContain("ON CONFLICT (caller_id, idempotency_key) DO NOTHING RETURNING *");
+    expect(lookup).toHaveBeenCalledWith("caller", "key");
+  });
+
+  it("migrates existing API keys to explicit channel permissions without escalation", () => {
+    expect(DATABASE_MIGRATION_SQL).toContain("ADD COLUMN IF NOT EXISTS execution_channels");
+    expect(DATABASE_MIGRATION_SQL).toContain(
+      "WHEN 'admin' = ANY(scopes) OR 'chatgpt:web' = ANY(scopes)",
+    );
+    expect(DATABASE_MIGRATION_SQL).toContain("ELSE ARRAY['codex']::TEXT[]");
+    expect(DATABASE_MIGRATION_SQL).toContain("ALTER COLUMN execution_channels SET NOT NULL");
+  });
+
+  it("types the web-account pacing cutoff as a timestamp", async () => {
+    const repository = new PostgresJobRepository(
+      "postgresql://unused:unused@127.0.0.1:1/unused",
+      Buffer.alloc(32).toString("base64"),
+    );
+    const queries: string[] = [];
+    const client = {
+      query: async (text: string) => {
+        queries.push(text);
+        return { rowCount: 0, rows: [] };
+      },
+      release: () => undefined,
+    };
+    Object.defineProperty(repository, "pool", {
+      value: { connect: async () => client },
+    });
+
+    await expect(
+      repository.acquireChatGptWebAccountLease(
+        "00000000-0000-4000-8000-000000000006",
+        ["account-b"],
+        new Date("2026-09-01T12:00:00.000Z"),
+        900_000,
+      ),
+    ).resolves.toBeNull();
+
+    const pacingQuery = queries.find((query) => query.includes("lastSubmissionAt"));
+    expect(pacingQuery).toContain("$2::timestamptz - INTERVAL '90 seconds'");
+    expect(pacingQuery).toContain("ORDER BY slot");
+  });
+
+  it("guards PostgreSQL submit-intent progress with the live account lease", async () => {
+    const repository = new PostgresJobRepository(
+      "postgresql://unused:unused@127.0.0.1:1/unused",
+      Buffer.alloc(32).toString("base64"),
+    );
+    let query = "";
+    Object.defineProperty(repository, "pool", {
+      value: {
+        query: async (sql: string) => {
+          query = sql;
+          return { rowCount: 0, rows: [] };
+        },
+      },
+    });
+
+    await expect(
+      repository.advanceChatGptWebSubmitIntent(randomUUID(), 7, "failed", 2),
+    ).resolves.toBe(false);
+    expect(query).toContain("account.lease_job_id=chatgpt_web_submit_intents.job_id");
+    expect(query).toContain("account.lease_epoch=$2");
+    expect(query).toContain("account.lease_expires_at > NOW()");
+  });
+});

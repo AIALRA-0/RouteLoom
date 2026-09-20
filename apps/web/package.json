@@ -1,0 +1,25 @@
+{
+  "name": "@aialra/web",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "next build",
+    "dev": "next dev --hostname 127.0.0.1 --port 13211",
+    "start": "next start --hostname 127.0.0.1 --port 13211",
+    "lint": "eslint app components",
+    "test": "vitest run --passWithNoTests",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@simplewebauthn/browser": "latest",
+    "katex": "^0.18.4",
+    "next": "latest",
+    "react": "latest",
+    "react-dom": "latest"
+  },
+  "devDependencies": {
+    "@types/katex": "^0.16.8",
+    "@types/react": "latest",
+    "@types/react-dom": "latest"
+  }
+}

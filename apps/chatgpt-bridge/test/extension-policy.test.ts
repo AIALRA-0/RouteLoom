@@ -1,0 +1,278 @@
+import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+
+import { describe, expect, it } from "vitest";
+
+type ExtensionManifest = {
+  permissions: string[];
+  host_permissions: string[];
+  content_scripts: Array<{ js: string[] }>;
+};
+
+describe("single-page browser agent policy", () => {
+  it("limits page and bridge access to the two required origins", () => {
+    const manifest = JSON.parse(
+      readFileSync(new URL("../extension/manifest.json", import.meta.url), "utf8"),
+    ) as ExtensionManifest;
+
+    expect(manifest.permissions.toSorted()).toEqual(["storage", "tabs"]);
+    expect(manifest.host_permissions.toSorted()).toEqual([
+      "http://127.0.0.1:13216/*",
+      "https://chatgpt.com/*",
+    ]);
+    expect(manifest.permissions).not.toContain("cookies");
+    expect(manifest.permissions).not.toContain("clipboardRead");
+    expect(manifest.permissions).not.toContain("downloads");
+  });
+
+  it("pins the local Markdown renderer used for exact long-message ownership", () => {
+    const manifest = JSON.parse(
+      readFileSync(new URL("../extension/manifest.json", import.meta.url), "utf8"),
+    ) as ExtensionManifest;
+    const bundle = readFileSync(new URL("../extension/marked.umd.js", import.meta.url));
+    const license = readFileSync(
+      new URL("../extension/marked-LICENSE.md", import.meta.url),
+      "utf8",
+    );
+
+    expect(manifest.content_scripts[0]?.js).toEqual(["marked.umd.js", "content-script.js"]);
+    expect(bundle.subarray(0, 200).toString("utf8")).toContain("marked v18.0.13");
+    expect(createHash("sha256").update(bundle).digest("hex")).toBe(
+      "b147274a9ce27d17276587167e49483d719f6893eeca3a3667a59797661d3556",
+    );
+    expect(license).toContain("Permission is hereby granted, free of charge");
+  });
+
+  it("uses one page, native paste, one send, and immediate fresh-chat reset", () => {
+    const contentScript = readFileSync(
+      new URL("../extension/content-script.js", import.meta.url),
+      "utf8",
+    );
+    const serviceWorker = readFileSync(
+      new URL("../extension/service-worker.js", import.meta.url),
+      "utf8",
+    );
+    const bridgeServer = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
+
+    expect(contentScript).not.toContain("execCommand");
+    expect(contentScript).toContain('attempt === 1 ? "paste_prompt" : "paste_prompt_retry"');
+    expect(contentScript).toContain('action: "clear_clipboard"');
+    expect(contentScript).toContain('nativeClick(send, jobId, "send_prompt")');
+    expect(contentScript).toContain("async function sendRuntimeMessage");
+    expect(contentScript).toContain("const currentComposer = first(SELECTORS.composer)");
+    expect(contentScript).toContain("stableReads >= 2");
+    expect(contentScript).toContain("completionMarkerFor(invocation.jobId)");
+    expect(contentScript).toContain(
+      "`${objective} 回答完成后，在最后一行原样输出 ${completionMarker}`",
+    );
+    expect(contentScript).not.toContain(
+      "`${objective}\\n\\n回答完成后，在最后一行原样输出 ${completionMarker}`",
+    );
+    expect(contentScript).toContain("sample.includes(completionMarker)");
+    expect(contentScript).toContain("withoutCompletionMarker(rawOutputText, completionMarker)");
+    expect(contentScript).toContain("chatgpt_page_generation_blank");
+    expect(contentScript).toContain("chatgpt_output_incomplete_blank");
+    expect(contentScript).toContain("chatgpt_sources_missing");
+    expect(serviceWorker).toContain("chatgpt_sources_missing");
+    expect(contentScript).toContain('kind === "home" || kind === "conversation"');
+    expect(contentScript).toContain("personalized !== true");
+    expect(contentScript).toContain("const SELECTOR_DIAGNOSTIC_GRACE_MS = 5_000");
+    expect(contentScript).toContain("const TERMINAL_BLANK_CONFIRM_MS = 15_000");
+    expect(contentScript).toContain("const TERMINAL_COMPOSER_CONFIRM_MS = 30_000");
+    expect(contentScript).not.toContain("BLANK_ASSISTANT_GRACE_MS");
+    expect(contentScript).toContain("assistantObserved");
+    expect(contentScript).toContain("closest(\"[data-testid^='conversation-turn']\")");
+    expect(contentScript).toContain("button[aria-label*='Retry' i]");
+    expect(contentScript).toContain('visibleErrorKind(control) === "retry"');
+    expect(contentScript).toContain("controls.push(control)");
+    expect(contentScript).toContain("hasTerminalCopyAction(newest)");
+    expect(contentScript).toContain("hasTerminalComposerState()");
+    expect(contentScript).toContain("users.length !== beforeUserCount + 1");
+    expect(contentScript).toContain('"user_echo_verified"');
+    expect(contentScript).not.toContain('pageKind() !== "conversation"');
+    expect(contentScript).not.toContain("stop_stalled_blank");
+    expect(contentScript).not.toContain("regenerate_blank");
+    expect(contentScript).not.toContain("recovering_blank_copy");
+    expect(contentScript).not.toContain('type: "aialra.native-copy"');
+    expect(contentScript).toContain('fetch("/api/auth/session"');
+    expect(contentScript).toContain('fetch("/backend-api/wham/usage"');
+    expect(contentScript).toContain('source: "chatgpt-usage"');
+    expect(contentScript).toContain('accountQuota.errorCode === "login_required"');
+    expect(serviceWorker).toContain("quota: accountQuota");
+
+    expect(serviceWorker).toContain("while (slots.size < 1)");
+    expect(serviceWorker).toContain("navigateToFreshChat");
+    expect(serviceWorker).toContain("resetSlot(slot)");
+    expect(serviceWorker).toContain("async function resetSlotUntilReady");
+    expect(serviceWorker).toContain("async function closeRedundantPristineTabs");
+    expect(serviceWorker).toContain("diagnostics?.freshConversation === true");
+    expect(serviceWorker).toContain("await resetSlotUntilReady(slot, expectedIntentId)");
+    expect(serviceWorker).toContain("const READY_STABILITY_MS = 2_000");
+    expect(serviceWorker).toContain("page?.diagnostics?.userTurnCount === 0");
+    expect(serviceWorker).toContain("page?.diagnostics?.assistantTurnCount === 0");
+    expect(serviceWorker).toContain("page?.diagnostics?.generationActive === false");
+    expect(serviceWorker).toContain("TEMPORARY_CHAT_URL");
+    expect(serviceWorker).toContain("temporaryReady ? TEMPORARY_CHAT_URL : CHATGPT_URL");
+    expect(serviceWorker).toContain("navigateToFreshChat(slot, false)");
+    expect(serviceWorker).toContain("navigateToFreshChat(slot, true)");
+    expect(serviceWorker).toContain("Begin ordinary chat requests on a new Temporary document");
+    expect(serviceWorker).toContain("A browser can restore an unsent draft");
+    expect(serviceWorker).toContain("requireEmptyComposer = true");
+    expect(serviceWorker).toContain("!requireEmptyComposer ||");
+    expect(serviceWorker).toContain("diagnostics.temporaryChatEnabled === true");
+    expect(serviceWorker).toContain("diagnostics.temporaryChatPersonalized !== true");
+    expect(contentScript).toContain("temporaryChatPersonalized() !== false");
+    expect(contentScript).toContain("await configureNonPersonalizedTemporaryChat");
+    expect(contentScript).toContain(
+      "let acceptedDefaultNonPersonalized = temporaryChatUrlEnabled()",
+    );
+    expect(contentScript).toContain('accessible name is then just "Temporary"');
+    expect(contentScript).toContain("acceptedDefaultNonPersonalized");
+    expect(contentScript).toContain("verifiedNonPersonalizedDocumentToken = DOCUMENT_TOKEN");
+    expect(contentScript).toContain('url.searchParams.get("temporary-chat") === "true"');
+    expect(contentScript).toContain("temporaryChatSemanticMarker()");
+    expect(contentScript).toContain("function temporaryChatIntroControl()");
+    expect(contentScript).toContain('"temporary_chat_intro"');
+    expect(contentScript).toContain("if (temporaryChatIntroControl())");
+    expect(contentScript).toContain("unpersonalized|non-personalized");
+    expect(contentScript).toContain("return null;");
+    expect(serviceWorker).toContain('type: "native_reset_request"');
+    expect(serviceWorker).not.toContain("quarantineSlot");
+    expect(serviceWorker).not.toContain("rotateSlot");
+    expect(serviceWorker).not.toContain("reloadForHydration");
+    expect(serviceWorker).not.toContain("setTimeout(resolve, 45_000)");
+    expect(serviceWorker).not.toContain("pendingNativeCopies");
+    const settleInvocation = serviceWorker.slice(
+      serviceWorker.indexOf("async function settleInvocation"),
+      serviceWorker.indexOf("async function cancel"),
+    );
+    expect(settleInvocation.indexOf('type: "completed"')).toBeLessThan(
+      settleInvocation.indexOf("await resetSlotUntilReady(slot, expectedIntentId)"),
+    );
+    expect(settleInvocation.indexOf('type: "failed"')).toBeLessThan(
+      settleInvocation.lastIndexOf("await resetSlotUntilReady(slot, expectedIntentId)"),
+    );
+    const cancelInvocation = serviceWorker.slice(
+      serviceWorker.indexOf("async function cancel"),
+      serviceWorker.indexOf("chrome.runtime.onMessage.addListener"),
+    );
+    expect(cancelInvocation.indexOf("cancelledJobs.add(jobId)")).toBeLessThan(
+      cancelInvocation.indexOf("await sendToTab"),
+    );
+    expect(cancelInvocation.indexOf("activeJobs.delete(jobId)")).toBeLessThan(
+      cancelInvocation.indexOf("await sendToTab"),
+    );
+    const nativeActionHandler = serviceWorker.slice(
+      serviceWorker.indexOf('if (!["aialra.native-click"'),
+      serviceWorker.indexOf("function connect()"),
+    );
+    expect(nativeActionHandler).toContain("const isStillActive = () =>");
+    expect(nativeActionHandler.indexOf("if (!isStillActive())")).toBeLessThan(
+      nativeActionHandler.indexOf('type: "native_click_request"'),
+    );
+    const invokeHandler = serviceWorker.slice(
+      serviceWorker.indexOf("async function invoke"),
+      serviceWorker.indexOf("async function settleInvocation"),
+    );
+    expect(invokeHandler).toContain(
+      'if (cancelledJobs.has(invocation.jobId)) throw new Error("chatgpt_delivery_uncertain")',
+    );
+    expect(invokeHandler.indexOf("activeJobs.set(invocation.jobId")).toBeLessThan(
+      invokeHandler.indexOf("await probe().catch"),
+    );
+    expect(invokeHandler.indexOf("await probe().catch")).toBeLessThan(
+      invokeHandler.indexOf("const accepted = await sendToTab"),
+    );
+    expect(invokeHandler).toContain("resetSlotUntilReady(slot, invocation.intentId)");
+    expect(serviceWorker).toContain("expectedIntentId && slot.intentId !== expectedIntentId");
+    expect(serviceWorker).toContain("setTimeout(() => cancelledJobs.delete(jobId), 60_000)");
+
+    expect(bridgeServer).toContain('message.type === "native_reset_request"');
+    expect(bridgeServer).toContain('"ctrl+v"');
+    expect(bridgeServer).toContain('spawn("xclip"');
+    expect(bridgeServer).toContain("clearX11Clipboard");
+    expect(bridgeServer).toContain("async function runFocusedXdotool");
+    expect(bridgeServer).toContain('throw new Error("native_action_cancelled")');
+    expect(bridgeServer).toContain(
+      "await operation(assertActive, expectedEntry.nativeActionController.signal)",
+    );
+    expect(bridgeServer).toContain("nativeActionController.abort()");
+    expect(bridgeServer).toContain("timeout: 5_000, signal");
+    const focusedClick = bridgeServer.slice(
+      bridgeServer.indexOf("async function runFocusedXdotoolAtPoint"),
+      bridgeServer.indexOf("function startX11Clipboard"),
+    );
+    expect(focusedClick.lastIndexOf("assertActive()")).toBeLessThan(
+      focusedClick.indexOf('await runXdotool(["click", "1"], signal)'),
+    );
+    expect(bridgeServer).toContain('["windowactivate", "--sync", windowId]');
+    expect(bridgeServer).toContain("setTimeout(resolve, 1_000)");
+    expect(bridgeServer).not.toContain("copyX11Text");
+    expect(contentScript).toContain("setTimeout(resolve, 750)");
+    expect(contentScript.match(/submitComposer\(send, invocation\.jobId\)/g)).toHaveLength(1);
+  });
+
+  it("can disable the unpacked extension for an isolated browser comparison", () => {
+    const entrypoint = readFileSync(
+      new URL("../../../deploy/chatgpt-browser/entrypoint.sh", import.meta.url),
+      "utf8",
+    );
+    const compose = readFileSync(new URL("../../../deploy/compose.yaml", import.meta.url), "utf8");
+    const diagnosticCompose = readFileSync(
+      new URL("../../../deploy/compose.chatgpt-diagnostic.yaml", import.meta.url),
+      "utf8",
+    );
+
+    expect(entrypoint).toContain("CHATGPT_BROWSER_EXTENSION_ENABLED:-true");
+    expect(entrypoint).toContain('if [ "$extension_enabled" = "true" ]');
+    expect(entrypoint).toContain('elif [ "$extension_enabled" != "false" ]');
+    expect(entrypoint).toContain("--disable-session-crashed-bubble");
+    expect(entrypoint).toContain("xdotool key --clearmodifiers Escape");
+    expect(entrypoint).toContain('node /usr/local/bin/normalize-profile-exit.mjs "$profile_dir"');
+    expect(entrypoint.indexOf("xdotool key --clearmodifiers Escape")).toBeLessThan(
+      entrypoint.indexOf("node /app/apps/chatgpt-bridge/dist/main.js &"),
+    );
+    expect(entrypoint).toContain('xdotool windowclose "$window_id"');
+    expect(entrypoint).toContain('kill -TERM "$chrome_pid"');
+    expect(entrypoint).toContain('[ "$attempt" -lt 80 ]');
+    expect(entrypoint).toContain('[ "$attempt" -lt 120 ]');
+    expect(compose).toContain(
+      "CHATGPT_BROWSER_EXTENSION_ENABLED: ${CHATGPT_BROWSER_EXTENSION_ENABLED:-true}",
+    );
+    expect(compose).toContain("stop_grace_period: 30s");
+    expect(diagnosticCompose).toContain(
+      "CHATGPT_BROWSER_EXTENSION_ENABLED: ${CHATGPT_BROWSER_EXTENSION_ENABLED:-false}",
+    );
+    expect(diagnosticCompose).toContain("chatgpt_browser_diagnostic_profile");
+    expect(diagnosticCompose).toContain('CHATGPT_WEB_ADAPTER_ENABLED: "false"');
+    const qualificationScript = readFileSync(
+      new URL("../../../deploy/scripts/qualify-chatgpt-web.mjs", import.meta.url),
+      "utf8",
+    );
+    expect(qualificationScript).toContain("async function waitForReadyHealth");
+  });
+
+  it("opens production admission without restarting a freshly verified browser session", () => {
+    const enableScript = readFileSync(
+      new URL("../../../deploy/scripts/enable-chatgpt-web.sh", import.meta.url),
+      "utf8",
+    );
+
+    expect(enableScript).toContain(
+      "CHATGPT_WEB_ADAPTER_ENABLED=true CHATGPT_WEB_DIAGNOSTIC_ENABLED=true",
+    );
+    expect(enableScript).not.toContain('"${compose[@]}" build');
+    expect(enableScript).toContain("process.exit(b.enabled&&b.sandboxVerified");
+    expect(enableScript).toContain(
+      '"${compose[@]}" up --detach --force-recreate --no-deps api worker',
+    );
+    expect(enableScript).toContain(
+      'restart_control_plane_with_rollback false true "$start_concurrency"',
+    );
+    expect(enableScript).toMatch(/start\)\s+assert_no_active_work/);
+    expect(enableScript).not.toContain('"${compose[@]}" up --detach --force-recreate api worker');
+    expect(enableScript).not.toContain(
+      "up --detach --force-recreate api worker chatgpt-browser chatgpt-browser-b",
+    );
+  });
+});

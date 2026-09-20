@@ -1,0 +1,41 @@
+stages:
+  - security
+  - verify
+
+default:
+  interruptible: true
+
+variables:
+  GIT_DEPTH: "0"
+  PNPM_STORE_DIR: ".pnpm-store"
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "web"
+
+secret-scan:
+  stage: security
+  image:
+    name: zricethezav/gitleaks:v8.30.1
+    entrypoint: [""]
+  script:
+    - gitleaks git --redact=100 --no-banner --no-color --log-level error .
+
+verify:
+  stage: verify
+  image: node:24-bookworm-slim
+  cache:
+    key:
+      files:
+        - pnpm-lock.yaml
+    paths:
+      - .pnpm-store/
+  before_script:
+    - corepack enable
+    - corepack prepare pnpm@10.10.0 --activate
+    - pnpm config set store-dir "$PNPM_STORE_DIR"
+  script:
+    - pnpm install --frozen-lockfile
+    - pnpm check

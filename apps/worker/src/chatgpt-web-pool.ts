@@ -1,0 +1,926 @@
+import {
+  ChatGptWebAccountSchema,
+  ChatGptWebAccountQuotaSchema,
+  ChatGptWebDiagnosticSummarySchema,
+  ChatGptWebFailurePhaseSchema,
+  ChatGptWebStatusSchema,
+  type ChatGptWebAccount,
+  type ChatGptWebStatus,
+  type ModelCatalogSnapshot,
+} from "@aialra/contracts";
+import type {
+  ChatGptWebAccountConfig,
+  ChatGptWebAccountRecord,
+  JobRepository,
+} from "@aialra/persistence";
+import type {
+  ModelProvider,
+  ProviderInvocation,
+  ProviderResult,
+  ProviderEvent,
+} from "@aialra/providers";
+
+import { RunnerClientProvider, RunnerProviderError, RunnerQuotaClient } from "./runner-client.js";
+import { CHATGPT_WEB_ACCOUNT_LEASE_MS, startLeaseRenewal } from "./lease-renewal.js";
+
+const ACCOUNT_HEARTBEAT_STALE_MS = 45_000;
+const POOL_WAIT_MS = 250;
+
+const HARD_FAILURE_CODES = new Set([
+  "chatgpt_login_required",
+  "chatgpt_verification_required",
+  "chatgpt_ui_changed",
+  "chatgpt_page_generation_blank",
+  "chatgpt_page_rendering_failed",
+  "chatgpt_output_selector_changed",
+]);
+
+const SUBMITTED_PHASES = new Set([
+  "action_started",
+  "submitted",
+  "user_echo_verified",
+  "generating",
+  "stabilizing",
+  "resetting",
+]);
+
+export type ChatGptWebPoolSubmissionState = "not_submitted" | "submitted" | "uncertain";
+
+export class ChatGptWebPoolError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+    readonly submissionState: ChatGptWebPoolSubmissionState,
+    readonly accountId: string | null = null,
+    readonly failurePhase: ChatGptWebAccount["failurePhase"] = null,
+    readonly diagnosticSummary: ChatGptWebAccount["diagnosticSummary"] = null,
+  ) {
+    super(`${code}:${message}`);
+    this.name = "ChatGptWebPoolError";
+  }
+}
+
+function safeAccount(account: ChatGptWebAccountRecord): ChatGptWebAccount {
+  const publicAccount = { ...account } as Record<string, unknown>;
+  delete publicAccount.bridgeUrl;
+  return ChatGptWebAccountSchema.parse(publicAccount);
+}
+
+function healthString(health: Record<string, unknown>, key: string): string | null {
+  return typeof health[key] === "string" ? String(health[key]) : null;
+}
+
+function safeFailurePhase(value: unknown): ChatGptWebAccount["failurePhase"] {
+  const parsed = ChatGptWebFailurePhaseSchema.safeParse(value);
+  return parsed.success ? parsed.data : null;
+}
+
+function safeDiagnosticSummary(value: unknown): ChatGptWebAccount["diagnosticSummary"] {
+  const parsed = ChatGptWebDiagnosticSummarySchema.safeParse(value);
+  return parsed.success ? parsed.data : null;
+}
+
+function safeAccountQuota(value: unknown): ChatGptWebAccount["quota"] | null {
+  const parsed = ChatGptWebAccountQuotaSchema.safeParse(value);
+  return parsed.success ? parsed.data : null;
+}
+
+function submitIntentStateForPhase(
+  phase: ChatGptWebAccount["failurePhase"],
+): "command_accepted" | "action_started" | "echo_verified" | null {
+  if (phase === "command_accepted") return "command_accepted";
+  if (phase === "action_started" || phase === "submitted") return "action_started";
+  if (["user_echo_verified", "generating", "stabilizing", "resetting"].includes(phase ?? "")) {
+    return "echo_verified";
+  }
+  return null;
+}
+
+function healthSlots(health: Record<string, unknown>): ChatGptWebStatus["slots"] {
+  const states = new Set<ChatGptWebStatus["slots"][number]["state"]>([
+    "starting",
+    "idle",
+    "preparing",
+    "ready",
+    "submitted",
+    "generating",
+    "completed",
+    "quarantined",
+  ]);
+  if (!Array.isArray(health.slots)) return [];
+  return health.slots.flatMap((value) => {
+    if (!value || typeof value !== "object") return [];
+    const slot = value as Record<string, unknown>;
+    const slotId = String(slot.slotId ?? "");
+    if (!/^[a-f0-9-]{36}$/i.test(slotId)) return [];
+    const state = String(slot.state ?? "starting") as ChatGptWebStatus["slots"][number]["state"];
+    return [
+      {
+        slotId,
+        state: states.has(state) ? state : "starting",
+        submitted: slot.submitted === true,
+        quarantinedUntil: typeof slot.quarantinedUntil === "string" ? slot.quarantinedUntil : null,
+        updatedAt: typeof slot.updatedAt === "string" ? slot.updatedAt : new Date().toISOString(),
+      },
+    ];
+  });
+}
+
+function accountHasActiveLease(account: ChatGptWebAccount, nowMs: number): boolean {
+  return Boolean(
+    account.activeJobId &&
+    account.leaseExpiresAt &&
+    new Date(account.leaseExpiresAt).getTime() > nowMs,
+  );
+}
+
+function accountCooldownActive(account: ChatGptWebAccount, nowMs: number): boolean {
+  if (account.rateLimitState !== "cooldown") return false;
+  if (!account.lastRateLimitAt || account.retryAfter == null) return true;
+  return new Date(account.lastRateLimitAt).getTime() + account.retryAfter * 1_000 > nowMs;
+}
+
+function accountEligibleForAdmission(account: ChatGptWebAccount, nowMs: number): boolean {
+  return (
+    account.enabled &&
+    account.qualified &&
+    ["ready", "busy"].includes(account.state) &&
+    !accountCooldownActive(account, nowMs)
+  );
+}
+
+function accountEligibleForLease(account: ChatGptWebAccount, nowMs: number): boolean {
+  return accountEligibleForAdmission(account, nowMs) && !accountHasActiveLease(account, nowMs);
+}
+
+function bridgeRecoveredToIdle(health: Record<string, unknown>): boolean {
+  const slots = healthSlots(health);
+  const slotsAreIdle =
+    slots.length === 0 || slots.every((slot) => slot.state === "idle" && !slot.submitted);
+  return (
+    Number(health.pending ?? 0) === 0 &&
+    (health.activeJobId === null || health.activeJobId === undefined) &&
+    healthString(health, "phase") === "idle" &&
+    slotsAreIdle
+  );
+}
+
+function accountPublicPatch(
+  current: ChatGptWebAccount,
+  health: Record<string, unknown> | null,
+  now: Date,
+): Partial<ChatGptWebAccount> {
+  if (!health) {
+    return {
+      state:
+        current.enabled && current.qualified && current.state !== "quarantined"
+          ? "stale"
+          : current.enabled
+            ? current.state
+            : "disabled",
+      lastHeartbeatAt: current.lastHeartbeatAt,
+    };
+  }
+  const authenticated = health.authenticated === true;
+  const extensionConnected = health.extensionConnected === true;
+  const pageReady = health.pageReady === true;
+  const sandboxVerified = health.sandboxVerified === true;
+  const failureCode = healthString(health, "failureCode");
+  const heartbeat = healthString(health, "lastHeartbeatAt") ?? now.toISOString();
+  const heartbeatTime = Date.parse(heartbeat);
+  const heartbeatStale =
+    !Number.isFinite(heartbeatTime) || now.getTime() - heartbeatTime > ACCOUNT_HEARTBEAT_STALE_MS;
+  const hardFailure = failureCode ? HARD_FAILURE_CODES.has(failureCode) : false;
+  const rateLimited = failureCode === "chatgpt_rate_limited";
+  const cooldownActive = accountCooldownActive(current, now.getTime());
+  const safelyRecovered =
+    current.lastProbePassed === true &&
+    authenticated &&
+    extensionConnected &&
+    pageReady &&
+    sandboxVerified &&
+    !heartbeatStale &&
+    !failureCode &&
+    bridgeRecoveredToIdle(health);
+  let state: ChatGptWebAccount["state"];
+  let qualified = current.qualified;
+  let rateLimitState = current.rateLimitState;
+  let retryAfter = current.retryAfter;
+  let lastRateLimitAt = current.lastRateLimitAt;
+  let consecutiveRateLimits = current.consecutiveRateLimits;
+
+  if (!current.enabled) {
+    state = "disabled";
+    // A disabled account can regain its already-proven qualification after a
+    // browser restart without submitting another real probe.
+    if (safelyRecovered) qualified = true;
+  } else if (current.activeJobId) state = "busy";
+  else if (rateLimited) {
+    state = "cooldown";
+    rateLimitState = "cooldown";
+    const candidateRetryAfter = Number(health.retryAfter ?? 1_800);
+    retryAfter =
+      Number.isInteger(candidateRetryAfter) && candidateRetryAfter >= 0
+        ? candidateRetryAfter
+        : 1_800;
+    if (current.rateLimitState !== "cooldown") {
+      consecutiveRateLimits += 1;
+      lastRateLimitAt = now.toISOString();
+    }
+  } else if (cooldownActive) state = "cooldown";
+  else if (safelyRecovered) {
+    qualified = true;
+    state = "ready";
+  } else if (current.state === "quarantined" && !current.qualified) state = "quarantined";
+  else if (hardFailure) {
+    qualified = false;
+    state = failureCode === "chatgpt_login_required" ? "login_required" : "quarantined";
+  } else if (!authenticated) {
+    // A startup snapshot without an explicit login failure is inconclusive.
+    // Keep the prior proof but do not admit tasks until the browser is ready.
+    state = "stale";
+  } else if (heartbeatStale || !extensionConnected || !pageReady || !sandboxVerified) {
+    state = "stale";
+  } else if (current.qualified || current.lastProbePassed === true) {
+    // A browser restart can briefly report an incomplete health snapshot. Keep
+    // the successful qualification fact and restore eligibility once the
+    // bridge is healthy again instead of requiring another real submission.
+    qualified = true;
+    state = "ready";
+  } else state = "configured";
+
+  if (rateLimited) {
+    qualified = current.qualified;
+  } else if (rateLimitState === "cooldown" && !cooldownActive) {
+    rateLimitState = "clear";
+    retryAfter = null;
+  }
+
+  return {
+    state,
+    qualified,
+    extensionConnected,
+    pageReady,
+    authenticated,
+    sandboxVerified,
+    lastHeartbeatAt: heartbeat,
+    rateLimitState,
+    retryAfter,
+    consecutiveRateLimits,
+    lastRateLimitAt,
+    lastSubmissionAt: healthString(health, "lastSubmissionAt") ?? current.lastSubmissionAt,
+    // Keep a current failure visible until the browser proves a complete,
+    // authenticated idle recovery. Once recovered, clear the active failure
+    // so the console cannot keep presenting an expired login warning as if it
+    // were still happening. lastFailureAt remains available as history.
+    lastFailureCode: failureCode ?? (safelyRecovered ? null : current.lastFailureCode),
+    lastFailureAt: failureCode ? now.toISOString() : current.lastFailureAt,
+    failurePhase:
+      safeFailurePhase(health.failurePhase) ?? (safelyRecovered ? null : current.failurePhase),
+    diagnosticSummary:
+      safeDiagnosticSummary(health.diagnosticSummary) ??
+      (safelyRecovered ? null : current.diagnosticSummary),
+    quota: safeAccountQuota(health.quota) ?? current.quota,
+    updatedAt: now.toISOString(),
+  };
+}
+
+export class ChatGptWebPoolProvider implements ModelProvider {
+  readonly name = "chatgpt_web" as const;
+  readonly workspaceMode = "provider" as const;
+  private readonly clients = new Map<string, RunnerClientProvider>();
+  private readonly quotaClients = new Map<string, RunnerQuotaClient>();
+  private readonly healthById = new Map<string, Record<string, unknown>>();
+
+  constructor(
+    private readonly repository: JobRepository,
+    private readonly configs: ChatGptWebAccountConfig[],
+    bridgeApiToken: string,
+    private readonly globalEnabled: boolean,
+  ) {
+    for (const config of configs) {
+      this.clients.set(
+        config.accountId,
+        new RunnerClientProvider(config.bridgeUrl, bridgeApiToken, "chatgpt_web"),
+      );
+      this.quotaClients.set(
+        config.accountId,
+        new RunnerQuotaClient(config.bridgeUrl, bridgeApiToken),
+      );
+    }
+  }
+
+  async syncAccounts(): Promise<void> {
+    await this.repository.syncChatGptWebAccounts(this.configs);
+    await this.refreshHealth();
+  }
+
+  async refreshHealth(): Promise<void> {
+    const accounts = await this.repository.listChatGptWebAccounts();
+    await Promise.all(
+      this.configs.map(async (config) => {
+        const quotaClient = this.quotaClients.get(config.accountId);
+        if (!quotaClient) return;
+        try {
+          const health = await quotaClient.readHealth();
+          this.healthById.set(config.accountId, health);
+          const current = accounts.find((account) => account.accountId === config.accountId);
+          if (current) {
+            await this.repository.updateChatGptWebAccount(
+              config.accountId,
+              accountPublicPatch(current, health, new Date()),
+            );
+          }
+        } catch {
+          this.healthById.delete(config.accountId);
+          const current = accounts.find((account) => account.accountId === config.accountId);
+          if (current) {
+            await this.repository.updateChatGptWebAccount(
+              config.accountId,
+              accountPublicPatch(current, null, new Date()),
+            );
+          }
+        }
+      }),
+    );
+    await this.refreshAggregateStatus();
+  }
+
+  async refreshAggregateStatus(): Promise<ChatGptWebStatus> {
+    const current = await this.repository.readChatGptWebStatus();
+    const records = await this.repository.listChatGptWebAccounts();
+    const accounts = records.map(safeAccount);
+    const nowMs = Date.now();
+    const qualified = accounts.filter((account) => account.enabled && account.qualified);
+    const eligible = accounts.filter((account) => accountEligibleForLease(account, nowMs));
+    const cooldownAccounts = qualified.filter((account) => accountCooldownActive(account, nowMs));
+    const anyQualified = qualified.length > 0;
+    const circuitState: ChatGptWebStatus["circuitState"] = !anyQualified
+      ? "qualification_required"
+      : eligible.length
+        ? "closed"
+        : "open";
+    const rateLimitState: ChatGptWebStatus["rateLimitState"] =
+      cooldownAccounts.length === qualified.length && qualified.length > 0
+        ? "cooldown"
+        : cooldownAccounts.length
+          ? "observation"
+          : "clear";
+    const retryAfter = cooldownAccounts.length
+      ? Math.min(
+          ...cooldownAccounts.map((account) =>
+            account.lastRateLimitAt && account.retryAfter != null
+              ? Math.max(
+                  1,
+                  Math.ceil(
+                    (Date.parse(account.lastRateLimitAt) + account.retryAfter * 1_000 - nowMs) /
+                      1_000,
+                  ),
+                )
+              : (account.retryAfter ?? 1),
+          ),
+        )
+      : null;
+    const lastFailure = records
+      .filter((account) => account.lastFailureAt)
+      .sort((left, right) =>
+        String(right.lastFailureAt).localeCompare(String(left.lastFailureAt)),
+      )[0];
+    const lastSubmission = records
+      .filter((account) => account.lastSubmissionAt)
+      .sort((left, right) =>
+        String(right.lastSubmissionAt).localeCompare(String(left.lastSubmissionAt)),
+      )[0];
+    const heartbeat = records
+      .filter((account) => account.lastHeartbeatAt)
+      .sort((left, right) =>
+        String(right.lastHeartbeatAt).localeCompare(String(left.lastHeartbeatAt)),
+      )[0];
+    const configured = accounts.filter((account) => accountEligibleForAdmission(account, nowMs));
+    const healthValues = this.configs.map((config) => this.healthById.get(config.accountId));
+    const activeTabs = healthValues.reduce(
+      (total, health) => total + Number(health?.activeTabs ?? 0),
+      0,
+    );
+    const slots = healthValues.flatMap((health) => healthSlots(health ?? {})).slice(0, 4);
+    const next = ChatGptWebStatusSchema.parse({
+      ...current,
+      configuredEnabled: this.globalEnabled,
+      effectiveConcurrency: this.globalEnabled ? eligible.length : 0,
+      maximumConcurrency: Math.max(1, Math.min(4, this.configs.length)),
+      activeTabs,
+      sandboxVerified:
+        configured.length > 0 && configured.every((account) => account.sandboxVerified),
+      extensionConnected:
+        configured.length > 0 && configured.every((account) => account.extensionConnected),
+      pageReady: configured.length > 0 && configured.every((account) => account.pageReady),
+      authenticated: configured.length > 0 && configured.every((account) => account.authenticated),
+      circuitState,
+      circuitReason:
+        circuitState === "qualification_required"
+          ? "qualification_not_completed"
+          : circuitState === "open"
+            ? "no_healthy_account"
+            : null,
+      cooldownUntil:
+        rateLimitState === "cooldown" && retryAfter != null
+          ? new Date(Date.now() + retryAfter * 1_000).toISOString()
+          : null,
+      rateLimitState,
+      retryAfter,
+      lastRateLimitAt:
+        cooldownAccounts
+          .map((account) => account.lastRateLimitAt)
+          .filter((value): value is string => Boolean(value))
+          .sort()
+          .at(-1) ?? current.lastRateLimitAt,
+      consecutiveRateLimits: Math.max(
+        0,
+        ...accounts.map((account) => account.consecutiveRateLimits),
+      ),
+      temporaryChatVerified: accounts.some((account) => account.lastProbePassed === true),
+      lastQualifiedAt:
+        accounts
+          .map((account) => account.lastProbeAt)
+          .filter((value): value is string => Boolean(value))
+          .sort()
+          .at(-1) ?? current.lastQualifiedAt,
+      lastQualificationPassed: accounts.some((account) => account.lastProbePassed === true),
+      activeJobId: accounts.find((account) => account.activeJobId)?.activeJobId ?? null,
+      activeAttempt: null,
+      lastHeartbeatAt: heartbeat?.lastHeartbeatAt ?? null,
+      lastResetAt: current.lastResetAt,
+      quarantinedTabs: healthValues.reduce(
+        (total, health) => total + Number(health?.quarantinedTabs ?? 0),
+        0,
+      ),
+      slots,
+      accounts,
+      phase: accounts.some((account) => account.state === "busy")
+        ? "generating"
+        : current.phase === "failed"
+          ? "failed"
+          : "idle",
+      adapterVersion:
+        healthValues.find((health) => typeof health?.adapterVersion === "string")?.adapterVersion ??
+        current.adapterVersion,
+      lastFailureCode: lastFailure?.lastFailureCode ?? current.lastFailureCode,
+      lastSubmissionAt: lastSubmission?.lastSubmissionAt ?? current.lastSubmissionAt,
+      updatedAt: new Date().toISOString(),
+    });
+    await this.repository.saveChatGptWebStatus(next);
+    return next;
+  }
+
+  async capacity(): Promise<number> {
+    const accounts = await this.repository.listChatGptWebAccounts();
+    return accounts.filter((account) => accountEligibleForLease(account, Date.now())).length;
+  }
+
+  async admission(): Promise<void> {
+    if (!this.globalEnabled) {
+      throw new ChatGptWebPoolError(
+        "chatgpt_web_circuit_open",
+        "The ChatGPT web channel is disabled.",
+        "not_submitted",
+      );
+    }
+    const accounts = await this.repository.listChatGptWebAccounts();
+    const qualified = accounts.filter((account) => account.enabled && account.qualified);
+    if (!qualified.length) {
+      throw new ChatGptWebPoolError(
+        "chatgpt_web_circuit_open",
+        "No ChatGPT web account has passed qualification.",
+        "not_submitted",
+      );
+    }
+    const now = Date.now();
+    if (qualified.every((account) => accountCooldownActive(account, now))) {
+      throw new ChatGptWebPoolError(
+        "chatgpt_rate_limited",
+        "All ChatGPT web accounts are cooling down.",
+        "not_submitted",
+      );
+    }
+  }
+
+  private async waitForLease(
+    jobId: string,
+    excluded: Set<string>,
+    signal?: AbortSignal,
+  ): Promise<ChatGptWebAccountRecord> {
+    while (!signal?.aborted) {
+      const now = new Date();
+      const ids = this.configs
+        .map((config) => config.accountId)
+        .filter((accountId) => !excluded.has(accountId));
+      const leased = await this.repository.acquireChatGptWebAccountLease(
+        jobId,
+        ids,
+        now,
+        CHATGPT_WEB_ACCOUNT_LEASE_MS,
+      );
+      if (leased) return leased;
+      const accounts = await this.repository.listChatGptWebAccounts();
+      const candidates = accounts.filter((account) => ids.includes(account.accountId));
+      const qualified = candidates.filter((account) => account.enabled && account.qualified);
+      if (!qualified.length) {
+        throw new ChatGptWebPoolError(
+          "chatgpt_web_circuit_open",
+          "No healthy ChatGPT web account is available.",
+          "not_submitted",
+        );
+      }
+      if (qualified.every((account) => accountCooldownActive(account, now.getTime()))) {
+        const retryAfter = Math.min(...qualified.map((account) => account.retryAfter ?? 1));
+        throw new ChatGptWebPoolError(
+          "chatgpt_rate_limited",
+          `All ChatGPT web accounts are cooling down; retry after ${retryAfter} seconds.`,
+          "not_submitted",
+        );
+      }
+      await this.sleep(POOL_WAIT_MS, signal);
+    }
+    throw new ChatGptWebPoolError(
+      "chatgpt_dispatch_cancelled",
+      "ChatGPT web dispatch was cancelled before an account was submitted.",
+      "not_submitted",
+    );
+  }
+
+  private async sleep(milliseconds: number, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) throw new Error("chatgpt_dispatch_cancelled");
+    await new Promise<void>((resolve, reject) => {
+      const onAbort = () => {
+        clearTimeout(timer);
+        reject(new Error("chatgpt_dispatch_cancelled"));
+      };
+      const timer = setTimeout(() => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve();
+      }, milliseconds);
+      timer.unref();
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
+  }
+
+  private async release(
+    account: ChatGptWebAccountRecord,
+    jobId: string,
+    patch: Partial<ChatGptWebAccount>,
+  ): Promise<void> {
+    const released = await this.repository.releaseChatGptWebAccountLease(
+      account.accountId,
+      jobId,
+      account.leaseEpoch,
+      patch,
+    );
+    if (!released) throw new Error("chatgpt_lease_lost");
+    await this.refreshAggregateStatus();
+  }
+
+  private async waitForBridgeIdle(accountId: string, deadlineAt: number): Promise<boolean> {
+    const client = this.quotaClients.get(accountId);
+    if (!client) return false;
+    const finalAt = Math.min(deadlineAt + 15_000, Date.now() + 15_000);
+    while (Date.now() < finalAt) {
+      try {
+        const health = await client.readHealth();
+        if (bridgeRecoveredToIdle(health)) return true;
+      } catch {
+        return false;
+      }
+      await this.sleep(250);
+    }
+    return false;
+  }
+
+  async invoke(invocation: ProviderInvocation): Promise<ProviderResult> {
+    if (!invocation.jobId) throw new Error("runner_job_id_required");
+    await this.admission();
+    const excluded = new Set<string>();
+    let lastPreSubmitError: ChatGptWebPoolError | null = null;
+
+    while (!invocation.signal?.aborted && excluded.size < this.configs.length) {
+      let account: ChatGptWebAccountRecord;
+      try {
+        account = await this.waitForLease(invocation.jobId, excluded, invocation.signal);
+      } catch (error) {
+        if (
+          lastPreSubmitError &&
+          error instanceof ChatGptWebPoolError &&
+          error.code === "chatgpt_web_circuit_open"
+        ) {
+          throw lastPreSubmitError;
+        }
+        throw error;
+      }
+      excluded.add(account.accountId);
+      const client = this.clients.get(account.accountId);
+      const requestedDepth = invocation.task.chatgptWeb?.thinkingDepth;
+      if (requestedDepth) {
+        try {
+          const quotaClient = this.quotaClients.get(account.accountId);
+          let supportsDepth = false;
+          let depthAvailabilityKnown = false;
+          for (let read = 0; read < 2; read += 1) {
+            const catalog = await quotaClient?.listModels();
+            const model = catalog?.models.find((entry) => entry.id === invocation.route.model);
+            const depths = model?.webThinkingDepths ?? [];
+            depthAvailabilityKnown ||= model?.available === false || depths.length > 0;
+            supportsDepth = model?.available === true && depths.includes(requestedDepth);
+            if (supportsDepth) break;
+            // A fresh Temporary Chat can briefly return an empty menu. Retry
+            // the read only; no invocation or message has been sent yet.
+            if (read === 0) await new Promise((resolve) => setTimeout(resolve, 1_000));
+          }
+          // An empty menu is an unknown observation, not proof that the depth
+          // is unsupported. The Browser verifies the exact depth before input.
+          if (depthAvailabilityKnown && !supportsDepth) {
+            await this.release(account, invocation.jobId, { state: "ready" });
+            lastPreSubmitError = new ChatGptWebPoolError(
+              "chatgpt_thinking_depth_unavailable",
+              "The requested depth is not available on this account.",
+              "not_submitted",
+              account.accountId,
+            );
+            continue;
+          }
+        } catch {
+          await this.release(account, invocation.jobId, { state: "ready" });
+          lastPreSubmitError = new ChatGptWebPoolError(
+            "chatgpt_browser_unavailable",
+            "Could not read the account's thinking menu before submission.",
+            "not_submitted",
+            account.accountId,
+          );
+          continue;
+        }
+      }
+      if (!client) {
+        await this.release(account, invocation.jobId, {
+          state: "quarantined",
+          qualified: false,
+          lastFailureAt: new Date().toISOString(),
+          lastFailureCode: "chatgpt_browser_unavailable",
+        });
+        lastPreSubmitError = new ChatGptWebPoolError(
+          "chatgpt_browser_unavailable",
+          "The configured account bridge is unavailable.",
+          "not_submitted",
+          account.accountId,
+        );
+        continue;
+      }
+
+      if (!invocation.deadlineAt) throw new Error("chatgpt_deadline_missing");
+      const deadlineAt = invocation.deadlineAt;
+      const intent = await this.repository.createChatGptWebSubmitIntent({
+        intentId: randomUUID(),
+        jobId: invocation.jobId,
+        accountId: account.accountId,
+        leaseEpoch: account.leaseEpoch,
+        state: "prepared",
+        phaseSequence: 0,
+        deadlineAt: new Date(deadlineAt).toISOString(),
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+      const phase = { value: null as ChatGptWebAccount["failurePhase"] };
+      let phaseSequence = intent.phaseSequence;
+      const onEvent = async (event: ProviderEvent) => {
+        if (event.data.kind === "chatgpt_web") {
+          phase.value = safeFailurePhase(event.data.phase);
+          const state = submitIntentStateForPhase(phase.value);
+          if (state) {
+            phaseSequence += 1;
+            const advanced = await this.repository.advanceChatGptWebSubmitIntent(
+              intent.intentId,
+              account.leaseEpoch,
+              state,
+              phaseSequence,
+            );
+            if (!advanced) throw new Error("chatgpt_lease_lost");
+          }
+        }
+        await invocation.onEvent?.({
+          ...event,
+          data: { ...event.data, accountId: account.accountId },
+        });
+      };
+      await invocation.onEvent?.({
+        type: "tool",
+        data: { kind: "chatgpt_web_account_assigned", accountId: account.accountId },
+      });
+
+      let leaseLost = false;
+      const leaseAbort = new AbortController();
+      const stopLeaseRenewal = startLeaseRenewal(
+        () =>
+          this.repository.renewChatGptWebAccountLease(
+            account.accountId,
+            invocation.jobId!,
+            account.leaseEpoch,
+            new Date(),
+            CHATGPT_WEB_ACCOUNT_LEASE_MS,
+          ),
+        () => {
+          leaseLost = true;
+          leaseAbort.abort(new Error("chatgpt_lease_lost"));
+        },
+      );
+      const signal = invocation.signal
+        ? AbortSignal.any([invocation.signal, leaseAbort.signal])
+        : leaseAbort.signal;
+
+      try {
+        const result = await client.invoke({
+          ...invocation,
+          deadlineAt,
+          webExecution: { intentId: intent.intentId, leaseEpoch: account.leaseEpoch },
+          signal,
+          onEvent,
+        });
+        const now = new Date().toISOString();
+        phaseSequence += 1;
+        await this.repository.advanceChatGptWebSubmitIntent(
+          intent.intentId,
+          account.leaseEpoch,
+          "completed",
+          phaseSequence,
+        );
+        const resetComplete = await this.waitForBridgeIdle(account.accountId, deadlineAt);
+        await this.release(account, invocation.jobId, {
+          state: resetComplete ? "ready" : "quarantined",
+          qualified: resetComplete,
+          rateLimitState: "clear",
+          retryAfter: null,
+          consecutiveRateLimits: 0,
+          lastSuccessAt: now,
+          lastFailureAt: null,
+          lastFailureCode: resetComplete ? null : "chatgpt_reset_incomplete",
+          failurePhase: null,
+          diagnosticSummary: null,
+          lastSubmissionAt:
+            phase.value && SUBMITTED_PHASES.has(phase.value) ? now : account.lastSubmissionAt,
+        });
+        return result;
+      } catch (error) {
+        const effectiveError = leaseLost
+          ? new RunnerProviderError(
+              "chatgpt_lease_lost",
+              "The account lease could not be renewed while the task was active.",
+              "uncertain",
+              phase.value,
+            )
+          : error;
+        const runnerError = effectiveError instanceof RunnerProviderError ? effectiveError : null;
+        const code =
+          runnerError?.code ??
+          (effectiveError instanceof Error
+            ? effectiveError.message.split(":", 1)[0]!
+            : "provider_error");
+        const leaseOwnershipLost = leaseLost || code === "chatgpt_lease_lost";
+        const submissionState = runnerError?.submissionState ?? "uncertain";
+        const failurePhase = runnerError?.failurePhase ?? phase.value;
+        const diagnosticSummary = runnerError?.diagnosticSummary ?? null;
+        const now = new Date().toISOString();
+        const hardFailure = HARD_FAILURE_CODES.has(code);
+        const rateLimited = code === "chatgpt_rate_limited";
+        // A pre-submit failure is safe to move to another qualified account. Once
+        // the bridge accepted the invocation, the task stays pinned forever,
+        // including for UI/login failures reported after the send boundary.
+        const canFailover = submissionState === "not_submitted";
+        const resetComplete = await this.waitForBridgeIdle(account.accountId, deadlineAt);
+        const safeToFailover = canFailover && resetComplete;
+        if (!canFailover) {
+          phaseSequence += 1;
+          await this.repository
+            .advanceChatGptWebSubmitIntent(
+              intent.intentId,
+              account.leaseEpoch,
+              "failed",
+              phaseSequence,
+            )
+            .catch(() => false);
+        }
+        const unavailableMode =
+          code === "chatgpt_mode_unavailable" &&
+          (failurePhase === "temporary_chat_verified" ||
+            failurePhase === "persistent_chat_verified");
+        const taskResultFailure = code === "chatgpt_sources_missing";
+        const quarantine =
+          !resetComplete ||
+          hardFailure ||
+          (!canFailover && !rateLimited && !unavailableMode && !taskResultFailure);
+        if (leaseOwnershipLost) {
+          await this.refreshAggregateStatus();
+        } else {
+          await this.release(account, invocation.jobId, {
+            state: rateLimited
+              ? "cooldown"
+              : quarantine
+                ? "quarantined"
+                : unavailableMode
+                  ? "ready"
+                  : taskResultFailure
+                    ? "ready"
+                    : "stale",
+            qualified: quarantine ? false : account.qualified,
+            rateLimitState: rateLimited ? "cooldown" : account.rateLimitState,
+            retryAfter: rateLimited ? (runnerError?.retryAfter ?? 1_800) : account.retryAfter,
+            lastRateLimitAt: rateLimited ? now : account.lastRateLimitAt,
+            lastFailureAt: now,
+            lastFailureCode: (resetComplete ? code : "chatgpt_reset_incomplete").slice(0, 128),
+            failurePhase,
+            diagnosticSummary,
+            lastSubmissionAt:
+              submissionState === "not_submitted" || unavailableMode
+                ? account.lastSubmissionAt
+                : now,
+          });
+        }
+        const poolError = new ChatGptWebPoolError(
+          code,
+          runnerError?.message ??
+            (effectiveError instanceof Error ? effectiveError.message : String(effectiveError)),
+          submissionState,
+          account.accountId,
+          failurePhase,
+          diagnosticSummary,
+        );
+        if (safeToFailover) {
+          lastPreSubmitError = poolError;
+          continue;
+        }
+        throw poolError;
+      } finally {
+        stopLeaseRenewal();
+      }
+    }
+
+    if (lastPreSubmitError) throw lastPreSubmitError;
+    throw new ChatGptWebPoolError(
+      "chatgpt_dispatch_cancelled",
+      "ChatGPT web dispatch ended before an account could submit.",
+      "not_submitted",
+    );
+  }
+
+  async listModels() {
+    const accounts = await this.repository.listChatGptWebAccounts();
+    const catalogs: ModelCatalogSnapshot[] = [];
+    for (const account of accounts.filter(
+      (item) => item.enabled && item.qualified && item.authenticated,
+    )) {
+      try {
+        const catalog = await this.quotaClients.get(account.accountId)?.listModels();
+        if (catalog) catalogs.push(catalog);
+      } catch {
+        continue;
+      }
+    }
+    const first = catalogs[0];
+    if (!first) throw new Error("runner_models_unavailable:pool");
+    const merged = new Map<string, ModelCatalogSnapshot["models"][number]>();
+    for (const catalog of catalogs) {
+      for (const model of catalog.models) {
+        const previous = merged.get(model.id);
+        merged.set(model.id, {
+          ...model,
+          available: model.available || previous?.available === true,
+          webThinkingDepths: [
+            ...new Set([
+              ...(previous?.webThinkingDepths ?? []),
+              ...(model.webThinkingDepths ?? []),
+            ]),
+          ],
+          defaultWebThinkingDepth:
+            previous && previous.defaultWebThinkingDepth !== model.defaultWebThinkingDepth
+              ? null
+              : model.defaultWebThinkingDepth,
+        });
+      }
+    }
+    return { ...first, models: [...merged.values()] };
+  }
+
+  async readHealth(): Promise<Record<string, unknown>> {
+    const status = await this.refreshAggregateStatus();
+    return {
+      status: status.circuitState === "closed" ? "ready" : "unavailable",
+      service: "routeloom-chatgpt-web-pool",
+      enabled: this.globalEnabled,
+      accounts: status.accounts,
+      activeTabs: status.activeTabs,
+      extensionConnected: status.extensionConnected,
+      pageReady: status.pageReady,
+      authenticated: status.authenticated,
+      sandboxVerified: status.sandboxVerified,
+      effectiveConcurrency: status.effectiveConcurrency,
+      maximumConcurrency: status.maximumConcurrency,
+      pending: status.queuedJobs,
+    };
+  }
+}
+import { randomUUID } from "node:crypto";

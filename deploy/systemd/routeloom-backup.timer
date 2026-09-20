@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily RouteLoom backup schedule
+
+[Timer]
+OnCalendar=*-*-* 03:15:00 UTC
+Persistent=true
+RandomizedDelaySec=900
+
+[Install]
+WantedBy=timers.target

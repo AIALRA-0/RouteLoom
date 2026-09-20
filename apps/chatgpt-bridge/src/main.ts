@@ -1,0 +1,1383 @@
+import { existsSync, readFileSync } from "node:fs";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { timingSafeEqual } from "node:crypto";
+import { execFile, spawn } from "node:child_process";
+
+import {
+  ModelCatalogSnapshotSchema,
+  RouteDecisionSchema,
+  TaskContractSchema,
+  UsageLedgerSchema,
+} from "@aialra/contracts";
+import { redact } from "@aialra/security";
+import { WebSocket, WebSocketServer } from "ws";
+import { z } from "zod";
+
+import { fixedBridgeError, sanitizeSourceUrls } from "./core.js";
+import {
+  BridgeInvocationSchema,
+  ExtensionFailedSchema,
+  ExtensionMessageSchema,
+  type BridgeInvocation,
+  type BrowserControlDiagnostics,
+  type BrowserAccountQuota,
+  type BrowserPageFailureCode,
+  type BrowserSlot,
+  type BrowserModel,
+  type ControllerMessage,
+} from "./protocol.js";
+
+type PendingInvocation = {
+  response: ServerResponse;
+  timer: NodeJS.Timeout;
+  heartbeat: NodeJS.Timeout;
+  startedAt: number;
+  settled: boolean;
+  nativeActions: Set<string>;
+  nativeActionController: AbortController;
+  intentId: string;
+  leaseEpoch: number;
+  deadlineAt: number;
+  connection: WebSocket;
+  lastProgressSequence: number;
+  lastProgressPhase: string | null;
+  submittedEventRecorded: boolean;
+  lastDiagnostics: BrowserControlDiagnostics | null;
+};
+
+const PROGRESS_PHASE_ORDER = new Map<string, number>([
+  ["command_accepted", 0],
+  ["opening", 1],
+  ["configuring", 2],
+  ["temporary_chat_verified", 3],
+  ["persistent_chat_verified", 3],
+  ["mode_selected", 4],
+  ["input_ready", 5],
+  ["action_started", 6],
+  ["submitted", 7],
+  ["user_echo_verified", 8],
+  ["generating", 9],
+  ["stabilizing", 10],
+  ["resetting", 11],
+  ["reset_completed", 12],
+]);
+
+type PublicDiagnosticSummary = {
+  pageKind: BrowserControlDiagnostics["pageKind"];
+  userTurnCount: number;
+  assistantTurnCount: number;
+  latestUserMatchesObjective: boolean | null;
+  generationActive: boolean;
+  latestAssistantHasText: boolean;
+  visibleErrorKinds: BrowserControlDiagnostics["visibleErrorKinds"];
+  temporaryChatVerified: boolean;
+  resolvedThinkingDepth: string | null;
+};
+
+function diagnosticSummary(
+  diagnostics: BrowserControlDiagnostics | null,
+): PublicDiagnosticSummary | null {
+  if (!diagnostics) return null;
+  return {
+    pageKind: diagnostics.pageKind,
+    userTurnCount: diagnostics.userTurnCount,
+    assistantTurnCount: diagnostics.assistantTurnCount,
+    latestUserMatchesObjective: diagnostics.latestUserMatchesObjective,
+    generationActive: diagnostics.generationActive,
+    latestAssistantHasText: diagnostics.latestAssistantHasText,
+    visibleErrorKinds: diagnostics.visibleErrorKinds,
+    temporaryChatVerified:
+      diagnostics.temporaryChatEnabled && diagnostics.temporaryChatPersonalized === false,
+    resolvedThinkingDepth: diagnostics.resolvedThinkingDepth,
+  };
+}
+
+function timeoutCode(entry: PendingInvocation): string {
+  const diagnostics = entry.lastDiagnostics;
+  if (
+    entry.lastProgressPhase === "generating" ||
+    entry.lastProgressPhase === "stabilizing" ||
+    entry.lastProgressPhase === "user_echo_verified"
+  ) {
+    if (diagnostics?.latestAssistantHasText) return "chatgpt_output_incomplete";
+    if (diagnostics?.visibleErrorKinds.includes("generation_error")) {
+      return "chatgpt_page_rendering_failed";
+    }
+    return "chatgpt_page_generation_blank";
+  }
+  if (
+    entry.lastProgressPhase === "submitted" ||
+    entry.lastProgressPhase === "action_started" ||
+    entry.lastProgressPhase === "input_ready" ||
+    entry.lastProgressPhase === "command_accepted"
+  ) {
+    return "chatgpt_delivery_uncertain";
+  }
+  if (entry.lastProgressPhase) return "chatgpt_page_not_ready";
+  return "chatgpt_timeout";
+}
+
+const RunnerRequestSchema = z.object({
+  jobId: z.string().uuid(),
+  attempt: z.number().int().min(1).max(2).default(1),
+  deadlineAt: z.number().int().positive(),
+  webExecution: z
+    .object({
+      intentId: z.string().uuid(),
+      leaseEpoch: z.number().int().nonnegative(),
+    })
+    .required(),
+  task: TaskContractSchema,
+  route: RouteDecisionSchema,
+});
+
+function requiredEnvironment(name: string): string {
+  const secretPath = process.env[`${name}_FILE`];
+  if (secretPath && existsSync(secretPath)) return readFileSync(secretPath, "utf8").trim();
+  const value = process.env[name];
+  if (!value) throw new Error(`${name} is required`);
+  return value;
+}
+
+function json(response: ServerResponse, status: number, value: unknown): void {
+  response.writeHead(status, { "content-type": "application/json; charset=utf-8" });
+  response.end(JSON.stringify(value));
+}
+
+async function readJson(request: IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of request) {
+    const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += value.length;
+    if (size > 1_000_000) throw new Error("request_too_large");
+    chunks.push(value);
+  }
+  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+}
+
+function authorized(request: IncomingMessage, token: string): boolean {
+  const header = request.headers.authorization;
+  if (!header?.startsWith("Bearer ")) return false;
+  const candidate = Buffer.from(header.slice(7));
+  const expected = Buffer.from(token);
+  return candidate.length === expected.length && timingSafeEqual(candidate, expected);
+}
+
+function tokenMatches(candidate: string | null, expected: string): boolean {
+  if (!candidate) return false;
+  const candidateBuffer = Buffer.from(candidate);
+  const expectedBuffer = Buffer.from(expected);
+  return (
+    candidateBuffer.length === expectedBuffer.length &&
+    timingSafeEqual(candidateBuffer, expectedBuffer)
+  );
+}
+
+function writeFrame(response: ServerResponse, value: unknown): void {
+  response.write(`${JSON.stringify(value)}\n`);
+}
+
+function isLoopback(address: string | undefined): boolean {
+  return address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1";
+}
+
+function x11Environment(): NodeJS.ProcessEnv {
+  return { ...process.env, DISPLAY: ":99" };
+}
+
+function runXdotool(arguments_: string[], signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    execFile("xdotool", arguments_, { env: x11Environment(), timeout: 5_000, signal }, (error) => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
+}
+
+function findChromiumWindow(): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      "xdotool",
+      ["search", "--onlyvisible", "--class", "chromium"],
+      { env: x11Environment(), timeout: 5_000, encoding: "utf8" },
+      (error, stdout) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        const windowId = stdout
+          .trim()
+          .split(/\s+/)
+          .filter((candidate) => /^\d+$/.test(candidate))
+          .at(-1);
+        if (!windowId) reject(new Error("chromium_window_unavailable"));
+        else resolve(windowId);
+      },
+    );
+  });
+}
+
+type BrowserPoint = { x: number; y: number };
+
+type X11WindowGeometry = BrowserPoint & {
+  width: number;
+  height: number;
+};
+
+function findChromiumWindowGeometry(windowId: string): Promise<X11WindowGeometry> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      "xdotool",
+      ["getwindowgeometry", "--shell", windowId],
+      { env: x11Environment(), timeout: 5_000, encoding: "utf8" },
+      (error, stdout) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        const values = Object.fromEntries(
+          stdout
+            .split(/\r?\n/)
+            .map((line) => line.match(/^(X|Y|WIDTH|HEIGHT)=(-?\d+)$/))
+            .filter((match): match is RegExpMatchArray => Boolean(match))
+            .map((match) => [match[1], Number(match[2])]),
+        );
+        const geometry = {
+          x: values.X,
+          y: values.Y,
+          width: values.WIDTH,
+          height: values.HEIGHT,
+        };
+        if (Object.values(geometry).some((value) => !Number.isFinite(value))) {
+          reject(new Error("chromium_window_geometry_unavailable"));
+          return;
+        }
+        resolve(geometry);
+      },
+    );
+  });
+}
+
+function findChromiumWindowFrameExtents(windowId: string): Promise<{ left: number; top: number }> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      "xprop",
+      ["-id", windowId, "_NET_FRAME_EXTENTS"],
+      { env: x11Environment(), timeout: 5_000, encoding: "utf8" },
+      (error, stdout) => {
+        const match = stdout?.match(/_NET_FRAME_EXTENTS\([^)]*\)\s*=\s*(\d+),\s*\d+,\s*(\d+),/);
+        if (error || !match) {
+          reject(new Error("chromium_window_frame_unavailable"));
+          return;
+        }
+        resolve({ left: Number(match[1]), top: Number(match[2]) });
+      },
+    );
+  });
+}
+
+async function translateBrowserPoint(
+  windowId: string,
+  point: BrowserPoint,
+  diagnostics: BrowserControlDiagnostics | null,
+): Promise<BrowserPoint> {
+  const metrics = diagnostics?.windowMetrics;
+  if (!metrics?.innerWidth || !metrics.innerHeight) return point;
+
+  const geometry = await findChromiumWindowGeometry(windowId);
+  const frame = await findChromiumWindowFrameExtents(windowId);
+  const reportedChromeWidth = Math.max(0, metrics.browserChromeWidth);
+  const reportedChromeHeight = Math.max(0, metrics.browserChromeHeight);
+  const viewportPoint = {
+    x: point.x - metrics.screenX - reportedChromeWidth / 2,
+    y: point.y - metrics.screenY - reportedChromeHeight,
+  };
+  const actualChromeWidth = Math.max(0, geometry.width - metrics.innerWidth);
+  const actualChromeHeight = Math.max(0, geometry.height - metrics.innerHeight);
+  return {
+    x: Math.round(geometry.x - frame.left + actualChromeWidth / 2 + viewportPoint.x),
+    y: Math.round(geometry.y - frame.top + actualChromeHeight + viewportPoint.y),
+  };
+}
+
+async function runFocusedXdotoolAtPoint(
+  point: BrowserPoint,
+  diagnostics: BrowserControlDiagnostics | null,
+  signal: AbortSignal,
+  assertActive: () => void = () => {},
+): Promise<void> {
+  assertActive();
+  const windowId = await findChromiumWindow();
+  assertActive();
+  const translated = await translateBrowserPoint(windowId, point, diagnostics);
+  assertActive();
+  await runXdotool(["windowactivate", "--sync", windowId], signal);
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assertActive();
+  await runXdotool(["mousemove", String(translated.x), String(translated.y)], signal);
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  assertActive();
+  await runXdotool(["click", "1"], signal);
+}
+
+function startX11Clipboard(
+  value: string,
+  options: { singleRequest?: boolean } = {},
+  signal?: AbortSignal,
+): Promise<ReturnType<typeof spawn>> {
+  return new Promise((resolve, reject) => {
+    const arguments_ = ["-selection", "clipboard", "-in", "-quiet"];
+    if (options.singleRequest) arguments_.push("-loops", "1");
+    const child = spawn("xclip", arguments_, {
+      env: x11Environment(),
+      stdio: ["pipe", "ignore", "ignore"],
+      signal,
+    });
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error("clipboard_start_timeout"));
+    }, 3_000);
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.stdin.once("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.stdin.end(value, () => {
+      clearTimeout(timer);
+      resolve(child);
+    });
+  });
+}
+
+function stopX11Clipboard(child: ReturnType<typeof spawn>): Promise<void> {
+  return new Promise((resolve) => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      resolve();
+    }, 1_000);
+    child.once("close", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    child.kill("SIGTERM");
+  });
+}
+
+function readX11Clipboard(signal?: AbortSignal): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      "xclip",
+      ["-selection", "clipboard", "-out"],
+      { env: x11Environment(), timeout: 2_000, maxBuffer: 64 * 1024, signal },
+      (error, output) => (error ? reject(error) : resolve(output)),
+    );
+  });
+}
+
+function waitForClipboardExit(child: ReturnType<typeof spawn>): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (child.exitCode !== null) {
+      if (child.exitCode === 0) resolve();
+      else reject(new Error("clipboard_write_failed"));
+      return;
+    }
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error("clipboard_consume_timeout"));
+    }, 3_000);
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else reject(new Error("clipboard_write_failed"));
+    });
+  });
+}
+
+async function pasteX11Text(
+  value: string,
+  x: number,
+  y: number,
+  diagnostics: BrowserControlDiagnostics | null,
+  signal: AbortSignal,
+  trace: (stage: string, point?: BrowserPoint) => void = () => {},
+  assertActive: () => void = () => {},
+): Promise<void> {
+  assertActive();
+  trace("locating_window");
+  const windowId = await findChromiumWindow();
+  assertActive();
+  const translated = await translateBrowserPoint(windowId, { x, y }, diagnostics);
+  assertActive();
+  trace("point_translated", translated);
+  await runXdotool(["windowactivate", "--sync", windowId], signal);
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assertActive();
+  // Large native pastes become attachments in ChatGPT. Small chunks keep the
+  // complete text in the editor; the extension verifies it before submission.
+  const points = Array.from(value);
+  const chunks: string[] = [];
+  for (let index = 0; index < points.length; index += 3_000) {
+    chunks.push(points.slice(index, index + 3_000).join(""));
+  }
+  if (!chunks.length) chunks.push("");
+  for (let index = 0; index < chunks.length; index += 1) {
+    assertActive();
+    const clipboard = await startX11Clipboard(chunks[index]!, {}, signal);
+    if (index === 0) trace("clipboard_started");
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      // stdin completion does not prove that xclip already owns the X11
+      // selection. Do not press Ctrl+V until the exact chunk is readable.
+      const clipboardDeadline = Date.now() + 2_000;
+      let clipboardReady = false;
+      while (Date.now() < clipboardDeadline) {
+        assertActive();
+        if ((await readX11Clipboard(signal).catch(() => null)) === chunks[index]) {
+          clipboardReady = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      if (!clipboardReady) throw new Error("clipboard_not_ready");
+      assertActive();
+      if (index === 0) trace("clipboard_verified");
+      const focus =
+        index === 0
+          ? [
+              "mousemove",
+              String(translated.x),
+              String(translated.y),
+              "sleep",
+              "0.05",
+              "click",
+              "1",
+              "sleep",
+              "0.15",
+              "key",
+              "--clearmodifiers",
+              "ctrl+a",
+              "key",
+              "BackSpace",
+            ]
+          : ["key", "--clearmodifiers", "ctrl+End"];
+      await runXdotool([...focus, "key", "--clearmodifiers", "ctrl+v"], signal);
+      if (index === chunks.length - 1) trace("paste_keys_completed");
+      // Chromium requests metadata before text. Keep each selection owner
+      // alive through its paste, then clear it before the next chunk.
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+      await stopX11Clipboard(clipboard);
+    } catch (error) {
+      clipboard.kill("SIGKILL");
+      throw error;
+    }
+  }
+  trace("clipboard_released");
+}
+
+async function clearX11Clipboard(signal?: AbortSignal): Promise<void> {
+  const clipboard = await startX11Clipboard("", { singleRequest: true }, signal);
+  // xclip accepts stdin before it necessarily owns the X11 selection. Give
+  // the empty owner a brief head start so the one-shot reader cannot win the
+  // race and report a false clear failure.
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const reader = spawn("xclip", ["-selection", "clipboard", "-out"], {
+    env: x11Environment(),
+    stdio: ["ignore", "ignore", "ignore"],
+    signal,
+  });
+  await Promise.all([
+    waitForClipboardExit(clipboard),
+    new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reader.kill("SIGKILL");
+        reject(new Error("clipboard_clear_timeout"));
+      }, 3_000);
+      reader.once("error", (error) => {
+        clearTimeout(timer);
+        reject(error);
+      });
+      reader.once("close", (code) => {
+        clearTimeout(timer);
+        if (code === 0) resolve();
+        else reject(new Error("clipboard_clear_failed"));
+      });
+    }),
+  ]);
+}
+
+async function main(): Promise<void> {
+  const apiToken = requiredEnvironment("CHATGPT_BRIDGE_API_TOKEN");
+  const extensionToken =
+    process.env.NODE_ENV === "production"
+      ? requiredEnvironment("CHATGPT_EXTENSION_TOKEN")
+      : (process.env.CHATGPT_EXTENSION_TOKEN ?? "development-only");
+  const enabled = process.env.CHATGPT_WEB_ADAPTER_ENABLED === "true";
+  const diagnosticEnabled = process.env.CHATGPT_WEB_DIAGNOSTIC_ENABLED === "true";
+  const diagnosticToken = diagnosticEnabled
+    ? requiredEnvironment("CHATGPT_WEB_DIAGNOSTIC_TOKEN")
+    : null;
+  const accountId = process.env.CHATGPT_WEB_ACCOUNT_ID ?? "account-a";
+  const sandboxVerified = process.env.CHATGPT_CHROMIUM_SANDBOX_VERIFIED === "true";
+  const maxConcurrency = 1;
+  const minimumDispatchIntervalMs = Math.max(
+    1_000,
+    Number(process.env.CHATGPT_WEB_MIN_DISPATCH_INTERVAL_MS ?? 90_000),
+  );
+  const port = Number(process.env.CHATGPT_BRIDGE_PORT ?? 13216);
+  const heartbeatMs = Math.max(1_000, Number(process.env.CHATGPT_BRIDGE_HEARTBEAT_MS ?? 15_000));
+  const pending = new Map<string, PendingInvocation>();
+  const nativeActionQueues = new Map<string, Promise<void>>();
+  let extension: WebSocket | null = null;
+  let extensionConnectedAt: string | null = null;
+  let pageReady = false;
+  let authenticated = false;
+  let discoveredModels: BrowserModel[] = [];
+  let accountQuota: BrowserAccountQuota = {
+    status: "unavailable",
+    source: "chatgpt-usage",
+    fetchedAt: null,
+    windows: [],
+    errorCode: null,
+  };
+  let modelCatalogRevision = 0;
+  const modelCatalogWaiters = new Set<(revision: number) => void>();
+  let activeTabs = 0;
+  let controlDiagnostics: BrowserControlDiagnostics | null = null;
+  let browserFailureCode: BrowserPageFailureCode | null = null;
+  let browserSlots: BrowserSlot[] = [];
+  let quarantinedTabs = 0;
+  let adapterVersion = "dom-bridge-v2";
+  let phase:
+    | "idle"
+    | "preparing"
+    | "input_verified"
+    | "submitted"
+    | "generating"
+    | "completed"
+    | "failed"
+    | "login_required"
+    | "quarantined"
+    | "resetting" = "idle";
+  let activeJobId: string | null = null;
+  let activeAttempt: number | null = null;
+  let lastHeartbeatAt: string | null = null;
+  let lastFailureCode: string | null = null;
+  let lastFailureDiagnostics: Record<string, unknown> | null = null;
+  let lastNativeInput: Record<string, unknown> | null = null;
+  let lastResetAt: string | null = null;
+  let lastSubmissionAt: string | null = null;
+  let temporaryChatVerified = false;
+
+  const waitForModelCatalogUpdate = (previousRevision: number): Promise<void> =>
+    new Promise((resolve) => {
+      const finish = (revision: number) => {
+        if (revision <= previousRevision) return;
+        clearTimeout(timer);
+        modelCatalogWaiters.delete(finish);
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        modelCatalogWaiters.delete(finish);
+        resolve();
+      }, 10_000);
+      timer.unref();
+      modelCatalogWaiters.add(finish);
+    });
+
+  const finishActiveInvocation = (
+    jobId: string,
+    nextPhase: typeof phase,
+    failureCode: string | null,
+    diagnostics: BrowserControlDiagnostics | null,
+  ) => {
+    if (activeJobId !== jobId) return;
+    phase = nextPhase;
+    activeJobId = null;
+    activeAttempt = null;
+    lastFailureCode = failureCode;
+    lastFailureDiagnostics = diagnostics;
+    lastHeartbeatAt = new Date().toISOString();
+  };
+
+  const failPending = (
+    jobId: string,
+    code: string,
+    message = fixedBridgeError(code),
+    diagnostics: BrowserControlDiagnostics | null = null,
+  ) => {
+    const entry = pending.get(jobId);
+    if (!entry || entry.settled) return;
+    const failureDiagnostics = diagnostics ?? entry.lastDiagnostics;
+    entry.settled = true;
+    entry.nativeActionController.abort();
+    clearTimeout(entry.timer);
+    clearInterval(entry.heartbeat);
+    writeFrame(entry.response, {
+      type: "error",
+      error: {
+        code,
+        message,
+        failurePhase: entry.lastProgressPhase,
+        diagnosticSummary: diagnosticSummary(failureDiagnostics),
+      },
+    });
+    entry.response.end();
+    pending.delete(jobId);
+    finishActiveInvocation(jobId, "failed", code, failureDiagnostics);
+  };
+
+  const enqueueNativeAction = (
+    jobId: string,
+    operation: (assertActive: () => void, signal: AbortSignal) => Promise<void>,
+  ) => {
+    const expectedEntry = pending.get(jobId);
+    if (!expectedEntry || expectedEntry.settled) return;
+    const assertActive = () => {
+      const current = pending.get(jobId);
+      if (
+        current !== expectedEntry ||
+        expectedEntry.settled ||
+        expectedEntry.nativeActionController.signal.aborted ||
+        Date.now() >= expectedEntry.deadlineAt
+      ) {
+        throw new Error("native_action_cancelled");
+      }
+    };
+    const prior = nativeActionQueues.get(jobId) ?? Promise.resolve();
+    const next = prior
+      .then(async () => {
+        assertActive();
+        await operation(assertActive, expectedEntry.nativeActionController.signal);
+      })
+      .catch((error: unknown) => {
+        if (
+          expectedEntry?.nativeActionController.signal.aborted ||
+          (error instanceof Error && error.message === "native_action_cancelled")
+        )
+          return;
+        if (lastNativeInput?.jobId === jobId) {
+          const reason = error instanceof Error ? error.message : "";
+          const allowed = [
+            "chromium_window_unavailable",
+            "chromium_window_geometry_unavailable",
+            "clipboard_start_timeout",
+            "clipboard_consume_timeout",
+            "clipboard_write_failed",
+          ];
+          lastNativeInput = {
+            ...lastNativeInput,
+            stage: "failed",
+            failureKind: allowed.includes(reason) ? reason : "native_command_failed",
+          };
+        }
+        failPending(jobId, "chatgpt_delivery_uncertain");
+      })
+      .finally(() => {
+        if (nativeActionQueues.get(jobId) === next) nativeActionQueues.delete(jobId);
+      });
+    nativeActionQueues.set(jobId, next);
+  };
+
+  const abandonPending = (jobId: string) => {
+    const entry = pending.get(jobId);
+    if (!entry || entry.settled) return;
+    entry.settled = true;
+    entry.nativeActionController.abort();
+    clearTimeout(entry.timer);
+    clearInterval(entry.heartbeat);
+    if (entry.connection.readyState === WebSocket.OPEN) {
+      entry.connection.send(JSON.stringify({ type: "cancel", jobId } satisfies ControllerMessage));
+    }
+    pending.delete(jobId);
+    // The HTTP caller owns the result stream, not the browser slot. If that
+    // stream closes, release the controller's task identity immediately while
+    // the extension resets the page. A late event for this job is ignored
+    // because its pending entry no longer exists.
+    finishActiveInvocation(
+      jobId,
+      "resetting",
+      "chatgpt_client_disconnected",
+      entry.lastDiagnostics,
+    );
+  };
+
+  const server = createServer(async (request, response) => {
+    const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "127.0.0.1"}`);
+    if (request.method === "GET" && url.pathname === "/healthz") {
+      json(response, enabled && extension && pageReady && authenticated ? 200 : 503, {
+        status: enabled && extension && pageReady && authenticated ? "ready" : "unavailable",
+        service: "routeloom-chatgpt-web-bridge",
+        accountId,
+        enabled,
+        diagnosticEnabled,
+        sandboxVerified,
+        extensionConnected: Boolean(extension),
+        pageReady,
+        authenticated,
+        quota: accountQuota,
+        activeTabs,
+        slots: browserSlots,
+        quarantinedTabs,
+        adapterVersion,
+        maxConcurrency,
+        pending: pending.size,
+        connectedAt: extensionConnectedAt,
+        diagnosticsAvailable: Boolean(controlDiagnostics),
+        temporaryChatEnabled: controlDiagnostics?.temporaryChatEnabled ?? false,
+        temporaryChatPersonalized: controlDiagnostics?.temporaryChatPersonalized ?? null,
+        temporaryChatVerified,
+        failureCode: browserFailureCode,
+        phase,
+        activeJobId,
+        activeAttempt,
+        lastHeartbeatAt,
+        lastFailureCode,
+        lastResetAt,
+        lastSubmissionAt,
+      });
+      return;
+    }
+    const bearerAuthorized = authorized(request, apiToken);
+    const diagnosticAuthorized =
+      url.pathname === "/diagnostic/invoke" &&
+      diagnosticEnabled &&
+      (isLoopback(request.socket.remoteAddress) || bearerAuthorized) &&
+      tokenMatches(
+        request.headers["x-aialra-diagnostic-token"]?.toString() ?? null,
+        diagnosticToken ?? "",
+      );
+    if (!bearerAuthorized && !diagnosticAuthorized) {
+      json(response, 401, { error: { code: "unauthorized", message: "Unauthorized." } });
+      return;
+    }
+    if (request.method === "GET" && url.pathname === "/models") {
+      if (extension && !activeJobId) {
+        const update = waitForModelCatalogUpdate(modelCatalogRevision);
+        extension.send(JSON.stringify({ type: "probe", discoverModels: true }));
+        await update;
+      }
+      const snapshot = ModelCatalogSnapshotSchema.parse({
+        source: extension && pageReady && authenticated ? "chatgpt-web" : "unavailable",
+        fetchedAt: new Date().toISOString(),
+        models: [
+          { id: "chatgpt-web.auto", displayName: "ChatGPT 网页自动选择", available: true },
+        ].map((model) => ({
+          ...model,
+          webThinkingDepths: authenticated
+            ? (discoveredModels.find((entry) => entry.id === model.id)?.webThinkingDepths ?? [])
+            : [],
+          defaultWebThinkingDepth: authenticated
+            ? (discoveredModels.find((entry) => entry.id === model.id)?.defaultWebThinkingDepth ??
+              null)
+            : null,
+          provider: "chatgpt_web",
+          hidden: false,
+          isDefault: model.id === "chatgpt-web.auto",
+          supportedReasoningEfforts: [],
+          defaultReasoningEffort: null,
+          inputModalities: ["text"],
+          creditRate: null,
+          apiRate: null,
+          rateStatus: "unavailable",
+          streamingMode: "final_only",
+          discoveredAt: new Date().toISOString(),
+        })),
+      });
+      json(response, 200, snapshot);
+      return;
+    }
+    if (request.method === "GET" && url.pathname === "/diagnostics") {
+      json(response, 200, {
+        diagnostics: controlDiagnostics,
+        lastFailureDiagnostics,
+        lastNativeInput,
+      });
+      return;
+    }
+    if (request.method === "POST" && url.pathname === "/probe") {
+      if (extension?.readyState !== WebSocket.OPEN) {
+        json(response, 503, {
+          error: {
+            code: "chatgpt_browser_unavailable",
+            message: fixedBridgeError("chatgpt_browser_unavailable"),
+          },
+        });
+        return;
+      }
+      extension.send(
+        JSON.stringify({ type: "probe", discoverModels: true } satisfies ControllerMessage),
+      );
+      json(response, 202, { status: "probing" });
+      return;
+    }
+    const diagnosticRequest = url.pathname === "/diagnostic/invoke";
+    if (request.method === "POST" && (url.pathname === "/invoke" || diagnosticRequest)) {
+      if (diagnosticRequest) {
+        if (!diagnosticAuthorized) {
+          json(response, 404, { error: { code: "not_found", message: "Not found." } });
+          return;
+        }
+      } else if (!enabled) {
+        json(response, 503, {
+          error: { code: "chatgpt_web_disabled", message: "ChatGPT 网页实验通道尚未启用。" },
+        });
+        return;
+      }
+      if (browserFailureCode) {
+        if (browserFailureCode === "chatgpt_rate_limited") {
+          response.setHeader("Retry-After", "1800");
+        }
+        json(response, browserFailureCode === "chatgpt_rate_limited" ? 429 : 503, {
+          error: {
+            code: browserFailureCode,
+            message: fixedBridgeError(browserFailureCode),
+            retryAfter: browserFailureCode === "chatgpt_rate_limited" ? 1800 : null,
+          },
+        });
+        return;
+      }
+      if (!extension || extension.readyState !== WebSocket.OPEN || !pageReady || !authenticated) {
+        json(response, 503, {
+          error: {
+            code: "chatgpt_browser_unavailable",
+            message: fixedBridgeError("chatgpt_browser_unavailable"),
+          },
+        });
+        return;
+      }
+      if (pending.size >= maxConcurrency) {
+        json(response, 429, {
+          error: { code: "chatgpt_browser_busy", message: "ChatGPT 网页标签池当前没有空闲位置。" },
+        });
+        return;
+      }
+      try {
+        const value = RunnerRequestSchema.parse(await readJson(request));
+        if (value.route.provider !== "chatgpt_web" || !value.task.chatgptWeb) {
+          json(response, 400, {
+            error: { code: "invalid_chatgpt_web_task", message: "任务不属于 ChatGPT 网页通道。" },
+          });
+          return;
+        }
+        if (pending.has(value.jobId)) {
+          json(response, 409, {
+            error: { code: "duplicate_browser_job", message: "同一网页任务不能重复发送。" },
+          });
+          return;
+        }
+        const elapsedSinceLastSubmission = lastSubmissionAt
+          ? Date.now() - new Date(lastSubmissionAt).getTime()
+          : minimumDispatchIntervalMs;
+        if (elapsedSinceLastSubmission < minimumDispatchIntervalMs) {
+          const retryAfter = Math.max(
+            1,
+            Math.ceil((minimumDispatchIntervalMs - elapsedSinceLastSubmission) / 1_000),
+          );
+          response.setHeader("Retry-After", String(retryAfter));
+          json(response, 429, {
+            error: {
+              code: "chatgpt_web_pacing_required",
+              message: "距离上一次网页发送不足 90 秒，请稍后重试",
+              retryAfter,
+            },
+          });
+          return;
+        }
+        const invocation = BridgeInvocationSchema.parse({
+          jobId: value.jobId,
+          objective: value.task.objective,
+          model: value.route.model,
+          mode: value.task.chatgptWeb.mode,
+          conversationMode: value.task.chatgptWeb.conversationMode,
+          temporaryChat: value.task.chatgptWeb.temporaryChat,
+          personalized: value.task.chatgptWeb.personalized,
+          persistenceAcknowledged: value.task.chatgptWeb.persistenceAcknowledged,
+          requireSources: value.task.chatgptWeb.requireSources,
+          deadlineMs: value.task.deadlineMs,
+          deadlineAt: value.deadlineAt,
+          intentId: value.webExecution.intentId,
+          leaseEpoch: value.webExecution.leaseEpoch,
+          modelLabel: null,
+          ...(value.task.chatgptWeb.thinkingDepth
+            ? { thinkingDepth: value.task.chatgptWeb.thinkingDepth }
+            : {}),
+          diagnostic: diagnosticRequest,
+          attempt: value.attempt,
+        } satisfies BridgeInvocation);
+        const assignedExtension = extension;
+        if (!assignedExtension || assignedExtension.readyState !== WebSocket.OPEN) {
+          json(response, 503, {
+            error: {
+              code: "chatgpt_browser_unavailable",
+              message: fixedBridgeError("chatgpt_browser_unavailable"),
+            },
+          });
+          return;
+        }
+        if (invocation.deadlineAt <= Date.now()) {
+          json(response, 408, {
+            error: { code: "chatgpt_timeout", message: fixedBridgeError("chatgpt_timeout") },
+          });
+          return;
+        }
+        response.writeHead(200, {
+          "content-type": "application/x-ndjson; charset=utf-8",
+          "cache-control": "no-store",
+        });
+        const timer = setTimeout(
+          () => {
+            const entry = pending.get(invocation.jobId);
+            if (entry?.connection.readyState === WebSocket.OPEN)
+              entry.connection.send(
+                JSON.stringify({
+                  type: "cancel",
+                  jobId: invocation.jobId,
+                } satisfies ControllerMessage),
+              );
+            failPending(invocation.jobId, entry ? timeoutCode(entry) : "chatgpt_timeout");
+          },
+          Math.max(1, invocation.deadlineAt - Date.now()),
+        );
+        timer.unref();
+        const heartbeat = setInterval(() => {
+          if (response.writableEnded || response.destroyed) return;
+          writeFrame(response, {
+            type: "event",
+            event: {
+              type: "tool",
+              data: {
+                kind: "chatgpt_web_heartbeat",
+                currentPhase: phase,
+                at: new Date().toISOString(),
+              },
+            },
+          });
+        }, heartbeatMs);
+        heartbeat.unref();
+        pending.set(invocation.jobId, {
+          response,
+          timer,
+          heartbeat,
+          startedAt: Date.now(),
+          settled: false,
+          nativeActions: new Set(),
+          nativeActionController: new AbortController(),
+          intentId: invocation.intentId,
+          leaseEpoch: invocation.leaseEpoch,
+          deadlineAt: invocation.deadlineAt,
+          connection: assignedExtension,
+          lastProgressSequence: 0,
+          lastProgressPhase: null,
+          submittedEventRecorded: false,
+          lastDiagnostics: null,
+        });
+        phase = "preparing";
+        temporaryChatVerified = false;
+        activeJobId = invocation.jobId;
+        activeAttempt = invocation.attempt;
+        lastHeartbeatAt = new Date().toISOString();
+        request.once("aborted", () => abandonPending(invocation.jobId));
+        response.once("close", () => abandonPending(invocation.jobId));
+        try {
+          assignedExtension.send(
+            JSON.stringify({ type: "invoke", invocation } satisfies ControllerMessage),
+          );
+        } catch {
+          failPending(invocation.jobId, "chatgpt_browser_unavailable");
+        }
+      } catch (error) {
+        if (response.headersSent) {
+          response.end();
+          return;
+        }
+        json(response, 400, {
+          error: {
+            code: "invalid_request",
+            message: redact(error instanceof Error ? error.message : String(error)).slice(0, 500),
+          },
+        });
+      }
+      return;
+    }
+    json(response, 404, { error: { code: "not_found", message: "Not found." } });
+  });
+
+  const websocketServer = new WebSocketServer({ noServer: true });
+  server.on("upgrade", (request, socket, head) => {
+    const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "127.0.0.1"}`);
+    const origin = request.headers.origin ?? "";
+    if (
+      url.pathname !== "/extension" ||
+      !isLoopback(request.socket.remoteAddress) ||
+      !origin.startsWith("chrome-extension://") ||
+      !tokenMatches(url.searchParams.get("token"), extensionToken)
+    ) {
+      socket.destroy();
+      return;
+    }
+    websocketServer.handleUpgrade(request, socket, head, (websocket) => {
+      websocketServer.emit("connection", websocket, request);
+    });
+  });
+
+  websocketServer.on("connection", (websocket) => {
+    const replacedExtension = extension;
+    const replacedJobIds: string[] = [];
+    if (replacedExtension && replacedExtension !== websocket) {
+      for (const [jobId, entry] of pending) {
+        if (entry.connection !== replacedExtension) continue;
+        replacedJobIds.push(jobId);
+        if (replacedExtension.readyState === WebSocket.OPEN) {
+          replacedExtension.send(
+            JSON.stringify({ type: "cancel", jobId } satisfies ControllerMessage),
+          );
+        }
+        failPending(jobId, "chatgpt_browser_unavailable");
+      }
+      replacedExtension.close(1008, "replaced");
+    }
+    extension = websocket;
+    extensionConnectedAt = new Date().toISOString();
+    pageReady = false;
+    authenticated = false;
+    websocket.send(JSON.stringify({ type: "configure" } satisfies ControllerMessage));
+    // A replacement can come from either the same service worker or a fresh
+    // extension instance. Send cancellation to both generations; the active
+    // one resets the managed page, while an unrelated connection ignores it.
+    for (const jobId of replacedJobIds) {
+      websocket.send(JSON.stringify({ type: "cancel", jobId } satisfies ControllerMessage));
+    }
+    websocket.on("message", (data) => {
+      if (extension !== websocket) return;
+      const raw = JSON.parse(data.toString());
+      let parsed = ExtensionMessageSchema.safeParse(raw);
+      // Optional diagnostic drift must not discard an otherwise valid terminal
+      // failure. Keep validating the job ID and error code; never forward raw data.
+      if (!parsed.success && raw?.type === "failed")
+        parsed = ExtensionFailedSchema.safeParse({ ...raw, diagnostics: null });
+      if (!parsed.success) return;
+      const message = parsed.data;
+      if (message.type === "keepalive") {
+        lastHeartbeatAt = new Date().toISOString();
+        return;
+      }
+      if (message.type === "native_reset_request") {
+        void findChromiumWindow()
+          .then(async (windowId) => {
+            const translated = await translateBrowserPoint(
+              windowId,
+              { x: message.x, y: message.y },
+              controlDiagnostics,
+            );
+            await runXdotool([
+              "windowactivate",
+              "--sync",
+              windowId,
+              "mousemove",
+              String(translated.x),
+              String(translated.y),
+              "sleep",
+              "0.05",
+              "click",
+              "1",
+              "sleep",
+              "0.15",
+              "key",
+              "--clearmodifiers",
+              "ctrl+a",
+              "key",
+              "BackSpace",
+            ]);
+          })
+          .then(() =>
+            websocket.send(
+              JSON.stringify({
+                type: "native_reset_result",
+                requestId: message.requestId,
+                ok: true,
+              } satisfies ControllerMessage),
+            ),
+          )
+          .catch(() =>
+            websocket.send(
+              JSON.stringify({
+                type: "native_reset_result",
+                requestId: message.requestId,
+                ok: false,
+              } satisfies ControllerMessage),
+            ),
+          );
+        return;
+      }
+      if (message.type === "native_click_request" || message.type === "native_input_request") {
+        const entry = pending.get(message.jobId);
+        if (
+          !entry ||
+          entry.settled ||
+          entry.intentId !== message.intentId ||
+          entry.leaseEpoch !== message.leaseEpoch ||
+          Date.now() >= entry.deadlineAt ||
+          entry.nativeActions.size >= 10
+        ) {
+          failPending(message.jobId, "chatgpt_delivery_uncertain");
+          return;
+        }
+        if (entry.nativeActions.has(message.action)) return;
+        entry.nativeActions.add(message.action);
+        if (message.type === "native_input_request") {
+          enqueueNativeAction(message.jobId, async (assertActive, signal) => {
+            if (message.action === "clear_clipboard") {
+              assertActive();
+              await clearX11Clipboard(signal);
+              return;
+            }
+            if (message.x == null || message.y == null || message.text == null) {
+              throw new Error("invalid_native_input");
+            }
+            lastNativeInput = {
+              jobId: message.jobId,
+              stage: "accepted",
+              textLength: message.text.length,
+              requestedPoint: { x: message.x, y: message.y },
+              windowMetrics: controlDiagnostics?.windowMetrics ?? null,
+              at: new Date().toISOString(),
+            };
+            await pasteX11Text(
+              message.text,
+              message.x,
+              message.y,
+              controlDiagnostics,
+              signal,
+              (stage, point) => {
+                lastNativeInput = {
+                  ...lastNativeInput,
+                  stage,
+                  ...(point ? { translatedPoint: point } : {}),
+                };
+              },
+              assertActive,
+            );
+          });
+        } else {
+          enqueueNativeAction(message.jobId, (assertActive, signal) =>
+            runFocusedXdotoolAtPoint(
+              { x: message.x, y: message.y },
+              controlDiagnostics,
+              signal,
+              assertActive,
+            ),
+          );
+        }
+        return;
+      }
+      if (message.type === "hello" || message.type === "models") {
+        discoveredModels = message.authenticated ? message.models : [];
+        if (message.quota) accountQuota = message.quota;
+        if (message.type === "models") {
+          modelCatalogRevision += 1;
+          for (const waiter of modelCatalogWaiters) waiter(modelCatalogRevision);
+        }
+        pageReady = message.pageReady;
+        authenticated = message.authenticated;
+        activeTabs = message.activeTabs;
+        browserSlots = message.slots;
+        quarantinedTabs = message.quarantinedTabs;
+        adapterVersion = message.adapterVersion;
+        controlDiagnostics = message.diagnostics ?? null;
+        browserFailureCode = message.failureCode ?? null;
+        lastHeartbeatAt = new Date().toISOString();
+        const slotState = message.slots[0]?.state;
+        if (!activeJobId && slotState === "idle") {
+          if (phase !== "idle") lastResetAt = new Date().toISOString();
+          phase = "idle";
+        } else if (slotState === "starting") {
+          phase = "resetting";
+        } else if (
+          !activeJobId &&
+          (slotState === "login_required" || slotState === "quarantined")
+        ) {
+          phase = slotState;
+        }
+        return;
+      }
+      const entry = pending.get(message.jobId);
+      if (!entry || entry.settled) return;
+      if (message.type === "progress") {
+        if (message.sequence <= entry.lastProgressSequence) return;
+        const nextPhaseOrder = PROGRESS_PHASE_ORDER.get(message.phase) ?? -1;
+        const previousPhaseOrder = entry.lastProgressPhase
+          ? (PROGRESS_PHASE_ORDER.get(entry.lastProgressPhase) ?? -1)
+          : -1;
+        if (nextPhaseOrder < previousPhaseOrder) return;
+        entry.lastProgressSequence = message.sequence;
+        if (message.diagnostics) entry.lastDiagnostics = message.diagnostics;
+        // A verified user echo proves one submission even if its progress frame was lost.
+        // Recording this event must never delay or determine the browser invocation.
+        if (
+          message.phase === "user_echo_verified" &&
+          !entry.submittedEventRecorded &&
+          message.diagnostics?.userTurnCount === 1 &&
+          message.diagnostics.latestUserMatchesObjective === true
+        ) {
+          entry.submittedEventRecorded = true;
+          lastSubmissionAt = new Date().toISOString();
+          writeFrame(entry.response, {
+            type: "event",
+            event: {
+              type: "tool",
+              data: {
+                kind: "chatgpt_web",
+                phase: "submitted",
+                evidence: "user_echo_verified",
+                diagnosticSummary: diagnosticSummary(message.diagnostics),
+              },
+            },
+          });
+        }
+        if (message.phase === "submitted" && entry.submittedEventRecorded) return;
+        if (entry.lastProgressPhase === message.phase) {
+          if (message.diagnostics) {
+            writeFrame(entry.response, {
+              type: "event",
+              event: {
+                type: "tool",
+                data: {
+                  kind: "chatgpt_web_diagnostic",
+                  failurePhase: message.phase,
+                  diagnosticSummary: diagnosticSummary(message.diagnostics),
+                },
+              },
+            });
+          }
+          return;
+        }
+        entry.lastProgressPhase = message.phase;
+        phase =
+          message.phase === "input_ready" || message.phase === "command_accepted"
+            ? "input_verified"
+            : message.phase === "submitted" || message.phase === "action_started"
+              ? "submitted"
+              : message.phase === "user_echo_verified" ||
+                  message.phase === "generating" ||
+                  message.phase === "stabilizing"
+                ? "generating"
+                : message.phase === "resetting"
+                  ? "resetting"
+                  : "preparing";
+        lastHeartbeatAt = new Date().toISOString();
+        if (message.phase === "temporary_chat_verified") temporaryChatVerified = true;
+        if (message.phase === "submitted") {
+          lastSubmissionAt = lastHeartbeatAt;
+          entry.submittedEventRecorded = true;
+        }
+        writeFrame(entry.response, {
+          type: "event",
+          event: {
+            type: "tool",
+            data: {
+              kind: "chatgpt_web",
+              phase: message.phase,
+              diagnosticSummary: diagnosticSummary(message.diagnostics ?? null),
+            },
+          },
+        });
+      } else if (message.type === "failed") {
+        const code = message.code;
+        lastFailureDiagnostics = message.diagnostics ?? null;
+        const entry = pending.get(message.jobId);
+        if (entry && !entry.settled && message.diagnostics) {
+          entry.lastDiagnostics = message.diagnostics;
+          writeFrame(entry.response, {
+            type: "event",
+            event: {
+              type: "tool",
+              data: {
+                kind: "chatgpt_web_diagnostic",
+                failurePhase: entry.lastProgressPhase,
+                diagnosticSummary: diagnosticSummary(message.diagnostics),
+              },
+            },
+          });
+        }
+        failPending(message.jobId, code, fixedBridgeError(code), message.diagnostics ?? null);
+      } else if (message.type === "completed") {
+        entry.settled = true;
+        entry.nativeActionController.abort();
+        clearTimeout(entry.timer);
+        clearInterval(entry.heartbeat);
+        const sources = sanitizeSourceUrls(message.sources);
+        const usage = UsageLedgerSchema.parse({
+          inputTokens: 0,
+          cachedInputTokens: 0,
+          outputTokens: 0,
+          codexCredits: null,
+          apiEquivalentUsd: null,
+          quotaUsedPercentBefore: null,
+          quotaUsedPercentAfter: null,
+          quotaWindowDeltaPercent: null,
+          allocatedSubscriptionUsd: null,
+          measurementStatus: "unavailable",
+          subscriptionChannel: "chatgpt_pro_web",
+          sourceCount: sources.length,
+          durationMs: Date.now() - entry.startedAt,
+          attemptCount: activeAttempt ?? 1,
+          retryCount: Math.max(0, (activeAttempt ?? 1) - 1),
+        });
+        writeFrame(entry.response, {
+          type: "result",
+          result: {
+            output: message.outputText,
+            outputText: message.outputText,
+            threadId: null,
+            usage,
+            sources,
+            conversationUrl: message.conversationUrl,
+          },
+        });
+        entry.response.end();
+        pending.delete(message.jobId);
+        finishActiveInvocation(message.jobId, "completed", null, null);
+      }
+    });
+    websocket.once("close", () => {
+      if (extension !== websocket) return;
+      extension = null;
+      extensionConnectedAt = null;
+      pageReady = false;
+      authenticated = false;
+      activeTabs = 0;
+      browserSlots = [];
+      quarantinedTabs = 0;
+      controlDiagnostics = null;
+      browserFailureCode = null;
+      for (const jobId of [...pending.keys()]) {
+        failPending(jobId, "chatgpt_browser_unavailable");
+      }
+    });
+  });
+
+  server.listen(port, "0.0.0.0");
+
+  const shutdown = () => {
+    for (const jobId of [...pending.keys()]) failPending(jobId, "chatgpt_browser_unavailable");
+    extension?.close(1001, "shutdown");
+    websocketServer.close();
+    server.close(() => process.exit(0));
+  };
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
+}
+
+await main();

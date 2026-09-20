@@ -1,0 +1,4 @@
+interface:
+  display_name: "RouteLoom"
+  short_description: "Route private model jobs by quality, quota, and data policy"
+  default_prompt: "Use $routeloom to turn this task into a governed RouteLoom job."

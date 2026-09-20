@@ -1,0 +1,121 @@
+FROM node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS build
+ENV PNPM_HOME=/pnpm
+ENV PATH=$PNPM_HOME:$PATH
+RUN corepack enable
+WORKDIR /workspace
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml turbo.json tsconfig.base.json ./
+COPY apps ./apps
+COPY packages ./packages
+COPY openapi ./openapi
+RUN pnpm install --frozen-lockfile
+RUN pnpm build
+
+FROM node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS web
+ARG ROUTELOOM_RELEASE_REVISION=unknown
+LABEL org.opencontainers.image.revision=$ROUTELOOM_RELEASE_REVISION
+ENV NODE_ENV=production
+ENV PORT=13211
+ENV HOSTNAME=0.0.0.0
+WORKDIR /app
+COPY --from=build /workspace/apps/web/.next/standalone ./
+COPY --from=build /workspace/apps/web/.next/static ./apps/web/.next/static
+USER node
+EXPOSE 13211
+CMD ["node", "apps/web/server.js"]
+
+FROM node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS api
+ARG ROUTELOOM_RELEASE_REVISION=unknown
+LABEL org.opencontainers.image.revision=$ROUTELOOM_RELEASE_REVISION
+ENV NODE_ENV=production
+WORKDIR /app
+COPY --from=build /workspace/node_modules ./node_modules
+COPY --from=build /workspace/apps/api ./apps/api
+COPY --from=build /workspace/packages ./packages
+COPY --from=build /workspace/openapi ./openapi
+COPY --from=build /workspace/package.json ./package.json
+USER node
+EXPOSE 13210
+CMD ["node", "apps/api/dist/main.js"]
+
+FROM node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS worker
+ARG ROUTELOOM_RELEASE_REVISION=unknown
+LABEL org.opencontainers.image.revision=$ROUTELOOM_RELEASE_REVISION
+ENV NODE_ENV=production
+WORKDIR /app
+COPY --from=build /workspace/node_modules ./node_modules
+COPY --from=build /workspace/apps/worker ./apps/worker
+COPY --from=build /workspace/packages ./packages
+COPY --from=build /workspace/package.json ./package.json
+USER node
+EXPOSE 13212
+CMD ["node", "apps/worker/dist/main.js"]
+
+FROM node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS runner
+ARG ROUTELOOM_RELEASE_REVISION=unknown
+LABEL org.opencontainers.image.revision=$ROUTELOOM_RELEASE_REVISION
+ENV NODE_ENV=production
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install --global @openai/codex@0.149.1
+WORKDIR /app
+COPY --from=build /workspace/node_modules ./node_modules
+COPY --from=build /workspace/apps/runner ./apps/runner
+COPY --from=build /workspace/packages ./packages
+COPY --from=build /workspace/package.json ./package.json
+RUN mkdir -p /workspace/jobs && chown -R node:node /workspace/jobs
+USER node
+EXPOSE 13214
+CMD ["node", "apps/runner/dist/main.js"]
+
+FROM node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS chatgpt-browser
+ARG ROUTELOOM_RELEASE_REVISION=unknown
+LABEL org.opencontainers.image.revision=$ROUTELOOM_RELEASE_REVISION
+ENV NODE_ENV=production
+ENV HOME=/opt/routeloom-browser-home
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+      ca-certificates \
+      chromium \
+      fonts-noto-cjk \
+      novnc \
+      openbox \
+      websockify \
+      x11vnc \
+      xclip \
+      xdotool \
+      xvfb \
+    && rm -rf /var/lib/apt/lists/* \
+    && grep -Fq "        let autoconnect = WebUtil.getConfigVar('autoconnect', false);" /usr/share/novnc/app/ui.js \
+    && sed -i "s#        let autoconnect = WebUtil.getConfigVar('autoconnect', false);#        let autoconnect = WebUtil.getConfigVar('autoconnect', false); const browserPath = window.location.pathname; if (autoconnect === false \&\& ['/chatgpt-browser/vnc.html','/chatgpt-browser-b/vnc.html','/chatgpt-browser-c/vnc.html','/chatgpt-browser-d/vnc.html'].includes(browserPath)) autoconnect = true;#" /usr/share/novnc/app/ui.js \
+    && grep -Fq "autoconnect === false" /usr/share/novnc/app/ui.js \
+    && grep -Fq "        url += '/' + path;" /usr/share/novnc/app/ui.js \
+    && sed -i "s#        url += '/' + path;#        const routedPath = path === 'websockify' ? (() => { const prefix = window.location.pathname.match(new RegExp('^/(chatgpt-browser(?:-[b-d])?)/')); return prefix ? prefix[1] + '/websockify' : path; })() : path; url += '/' + routedPath;#" /usr/share/novnc/app/ui.js \
+    && grep -Fq "const routedPath" /usr/share/novnc/app/ui.js \
+    && ! grep -Fq "if (prefix) path =" /usr/share/novnc/app/ui.js \
+    && useradd --create-home --home-dir /opt/routeloom-browser-home --uid 1100 --shell /usr/sbin/nologin browser
+WORKDIR /app
+COPY --chown=browser:browser --from=build /workspace/node_modules ./node_modules
+COPY --chown=browser:browser --from=build /workspace/apps/chatgpt-bridge ./apps/chatgpt-bridge
+COPY --chown=browser:browser --from=build /workspace/packages ./packages
+COPY --chown=browser:browser --from=build /workspace/package.json ./package.json
+COPY --chown=browser:browser apps/chatgpt-bridge/extension /opt/aialra/chatgpt-extension
+COPY deploy/chatgpt-browser/entrypoint.sh /usr/local/bin/routeloom-chatgpt-browser
+COPY deploy/chatgpt-browser/normalize-profile-exit.mjs /usr/local/bin/normalize-profile-exit.mjs
+RUN chmod 0555 /usr/local/bin/routeloom-chatgpt-browser \
+    && mkdir -p /run/routeloom-chatgpt-bridge /run/routeloom-chatgpt-extension /opt/routeloom-browser-home/.config/chromium \
+    && chown -R browser:browser /run/routeloom-chatgpt-bridge /run/routeloom-chatgpt-extension /opt/routeloom-browser-home
+USER browser
+EXPOSE 13216 6080
+ENTRYPOINT ["/usr/local/bin/routeloom-chatgpt-browser"]
+
+FROM node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS chatgpt-egress-proxy
+ARG ROUTELOOM_RELEASE_REVISION=unknown
+LABEL org.opencontainers.image.revision=$ROUTELOOM_RELEASE_REVISION
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends squid ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY deploy/chatgpt-browser/squid.conf /etc/squid/squid.conf
+USER proxy
+EXPOSE 3128
+CMD ["squid", "-N", "-f", "/etc/squid/squid.conf"]
